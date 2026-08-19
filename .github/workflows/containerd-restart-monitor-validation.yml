@@ -7,12 +7,14 @@ on:
     paths:
       - .github/workflows/containerd-restart-monitor-validation.yml
       - oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
+      - oss-validation/containerd-restart-monitor/refine_candidate.py
   pull_request:
     branches:
       - main
     paths:
       - .github/workflows/containerd-restart-monitor-validation.yml
       - oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
+      - oss-validation/containerd-restart-monitor/refine_candidate.py
   workflow_dispatch:
 
 permissions:
@@ -29,6 +31,8 @@ jobs:
     env:
       UPSTREAM_SHA: 4d4d8b0ed29397cf0fc426c8c77a6c03c00d3092
       PATCH_FILE: oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
+      REFINEMENT_SCRIPT: oss-validation/containerd-restart-monitor/refine_candidate.py
+      FINAL_PATCH: containerd_restart_monitor_lifecycle.validated.patch
       CGO_ENABLED: "1"
     steps:
       - name: Check out validation harness
@@ -57,13 +61,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libseccomp-dev pkg-config
 
-      - name: Apply and format candidate patch
+      - name: Apply, refine, and format candidate patch
         shell: bash
         run: |
           set -euo pipefail
           git -C source apply --check "$GITHUB_WORKSPACE/$PATCH_FILE"
           git -C source apply "$GITHUB_WORKSPACE/$PATCH_FILE"
+          python3 "$GITHUB_WORKSPACE/$REFINEMENT_SCRIPT" "$GITHUB_WORKSPACE/source"
           gofmt -w source/plugins/restart/monitor.go source/plugins/restart/monitor_test.go
+          git -C source add -N plugins/restart/monitor_test.go
           git -C source diff --check
           git -C source status --short
           git -C source diff --stat
@@ -97,6 +103,24 @@ jobs:
           set -euo pipefail
           go vet ./plugins/restart ./cmd/containerd/server
 
+      - name: Create validated final patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C source diff --binary --full-index > "$GITHUB_WORKSPACE/$FINAL_PATCH"
+          test -s "$GITHUB_WORKSPACE/$FINAL_PATCH"
+          sha256sum "$GITHUB_WORKSPACE/$FINAL_PATCH" | tee "$GITHUB_WORKSPACE/$FINAL_PATCH.sha256"
+
+      - name: Upload validated patch
+        uses: actions/upload-artifact@v7
+        with:
+          name: containerd-restart-monitor-validated-patch
+          path: |
+            ${{ env.FINAL_PATCH }}
+            ${{ env.FINAL_PATCH }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Record validation summary
         if: always()
         shell: bash
@@ -107,4 +131,7 @@ jobs:
             echo "- Upstream SHA: \`$UPSTREAM_SHA\`"
             echo "- Go directive: \`$(awk '/^go / {print $2; exit}' source/go.mod 2>/dev/null || echo unavailable)\`"
             echo "- Workflow conclusion: \`${{ job.status }}\`"
+            if test -f "$FINAL_PATCH.sha256"; then
+              echo "- Final patch SHA-256: \`$(cut -d' ' -f1 "$FINAL_PATCH.sha256")\`"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
