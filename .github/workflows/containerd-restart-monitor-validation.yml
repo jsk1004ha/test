@@ -1,0 +1,104 @@
+name: Validate containerd restart monitor lifecycle
+
+on:
+  push:
+    branches:
+      - agent/containerd-restart-monitor-validation
+    paths:
+      - .github/workflows/containerd-restart-monitor-validation.yml
+      - oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: containerd-restart-monitor-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UPSTREAM_SHA: 4d4d8b0ed29397cf0fc426c8c77a6c03c00d3092
+      PATCH_FILE: oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
+      CGO_ENABLED: "1"
+    steps:
+      - name: Check out validation harness
+        uses: actions/checkout@v7
+
+      - name: Fetch pinned containerd source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/containerd/containerd.git
+          git -C source fetch --depth=1 origin "$UPSTREAM_SHA"
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$UPSTREAM_SHA"
+
+      - name: Install Go from upstream go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Install Linux build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libseccomp-dev pkg-config
+
+      - name: Apply and format candidate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C source apply --check "$GITHUB_WORKSPACE/$PATCH_FILE"
+          git -C source apply "$GITHUB_WORKSPACE/$PATCH_FILE"
+          gofmt -w source/plugins/restart/monitor.go source/plugins/restart/monitor_test.go
+          git -C source diff --check
+          git -C source status --short
+          git -C source diff --stat
+
+      - name: Run focused restart monitor tests
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          go test ./plugins/restart
+
+      - name: Run restart monitor race detector
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race ./plugins/restart
+
+      - name: Run containerd server tests
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./cmd/containerd/server
+
+      - name: Run focused vet
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./plugins/restart ./cmd/containerd/server
+
+      - name: Record validation summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## containerd restart monitor validation"
+            echo
+            echo "- Upstream SHA: \`$UPSTREAM_SHA\`"
+            echo "- Go directive: \`$(awk '/^go / {print $2; exit}' source/go.mod 2>/dev/null || echo unavailable)\`"
+            echo "- Workflow conclusion: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
