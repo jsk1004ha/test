@@ -7,13 +7,19 @@ on:
     paths:
       - .github/workflows/containerd-restart-monitor-validation.yml
       - oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/containerd-restart-monitor-validation.yml
+      - oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: containerd-restart-monitor-validation-${{ github.ref }}
+  group: containerd-restart-monitor-validation-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
