@@ -1,0 +1,72 @@
+name: Validate containerd restart monitor lifecycle
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - containerd_restart_monitor_lifecycle.patch
+      - .github/workflows/containerd-restart-monitor-validation.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out validation inputs
+        uses: actions/checkout@v4
+
+      - name: Clone current containerd main
+        run: git clone --depth 1 https://github.com/containerd/containerd.git source
+
+      - name: Set up the Go version required by containerd
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: source/go.mod
+          cache: true
+          cache-dependency-path: source/go.sum
+
+      - name: Apply and format candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          git apply --check ../containerd_restart_monitor_lifecycle.patch
+          git apply ../containerd_restart_monitor_lifecycle.patch
+          gofmt -w plugins/restart/monitor.go plugins/restart/monitor_test.go
+          git diff --check
+          git diff --stat
+
+      - name: Run restart monitor unit tests
+        working-directory: source
+        run: go test ./plugins/restart
+
+      - name: Run restart monitor race tests
+        working-directory: source
+        run: go test -race ./plugins/restart
+
+      - name: Run server lifecycle tests
+        working-directory: source
+        run: go test ./cmd/containerd/server
+
+      - name: Run focused vet
+        working-directory: source
+        run: go vet ./plugins/restart ./cmd/containerd/server
+
+      - name: Export the formatted candidate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          git diff --binary > ../containerd-restart-monitor-candidate.patch
+          test -s ../containerd-restart-monitor-candidate.patch
+
+      - name: Upload the validated patch
+        uses: actions/upload-artifact@v4
+        with:
+          name: containerd-restart-monitor-candidate
+          path: containerd-restart-monitor-candidate.patch
+          if-no-files-found: error
