@@ -2,71 +2,140 @@ name: Validate containerd restart monitor lifecycle
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths:
-      - containerd_restart_monitor_lifecycle.patch
       - .github/workflows/containerd-restart-monitor-validation.yml
+      - containerd_restart_monitor_lifecycle.patch
+      - containerd_restart_monitor_lifecycle.patch.sha256
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/containerd-restart-monitor-validation.yml
+      - containerd_restart_monitor_lifecycle.patch
+      - containerd_restart_monitor_lifecycle.patch.sha256
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: containerd-restart-monitor-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    env:
+      UPSTREAM_SHA: 4d4d8b0ed29397cf0fc426c8c77a6c03c00d3092
+      PATCH_FILE: containerd_restart_monitor_lifecycle.patch
+      EXPECTED_PATCH_SHA256: 65c667eaab69b9cb5a1b2d6bcd64742c1212ca3568bbe82f8c508859f57f7ee2
+      FINAL_PATCH: containerd_restart_monitor_lifecycle.validated.patch
+      CGO_ENABLED: "1"
     steps:
-      - name: Check out validation inputs
-        uses: actions/checkout@v4
+      - name: Check out validation harness
+        uses: actions/checkout@v7
 
-      - name: Clone current containerd main
-        run: git clone --depth 1 https://github.com/containerd/containerd.git source
-
-      - name: Set up the Go version required by containerd
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: source/go.mod
-          cache: true
-          cache-dependency-path: source/go.sum
-
-      - name: Apply and format candidate
+      - name: Verify candidate digest
         shell: bash
         run: |
           set -euo pipefail
-          cd source
-          git apply --check ../containerd_restart_monitor_lifecycle.patch
-          git apply ../containerd_restart_monitor_lifecycle.patch
-          gofmt -w plugins/restart/monitor.go plugins/restart/monitor_test.go
-          git diff --check
-          git diff --stat
+          echo "$EXPECTED_PATCH_SHA256  $PATCH_FILE" | sha256sum --check --strict
 
-      - name: Run restart monitor unit tests
-        working-directory: source
-        run: go test ./plugins/restart
+      - name: Fetch pinned containerd source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/containerd/containerd.git
+          git -C source fetch --depth=1 origin "$UPSTREAM_SHA"
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$UPSTREAM_SHA"
 
-      - name: Run restart monitor race tests
-        working-directory: source
-        run: go test -race ./plugins/restart
+      - name: Install Go from upstream go.mod
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: source/go.mod
+          cache: false
 
-      - name: Run server lifecycle tests
+      - name: Install Linux build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libseccomp-dev pkg-config
+
+      - name: Apply and format candidate patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C source apply --check "$GITHUB_WORKSPACE/$PATCH_FILE"
+          git -C source apply "$GITHUB_WORKSPACE/$PATCH_FILE"
+          gofmt -w source/plugins/restart/monitor.go source/plugins/restart/monitor_test.go
+          git -C source add -N plugins/restart/monitor_test.go
+          git -C source diff --check
+          git -C source status --short
+          git -C source diff --stat
+
+      - name: Run focused restart monitor tests
         working-directory: source
-        run: go test ./cmd/containerd/server
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          go test ./plugins/restart
+
+      - name: Run restart monitor race detector
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race ./plugins/restart
+
+      - name: Run containerd server tests
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./cmd/containerd/server
 
       - name: Run focused vet
         working-directory: source
-        run: go vet ./plugins/restart ./cmd/containerd/server
-
-      - name: Export the formatted candidate patch
         shell: bash
         run: |
           set -euo pipefail
-          cd source
-          git diff --binary > ../containerd-restart-monitor-candidate.patch
-          test -s ../containerd-restart-monitor-candidate.patch
+          go vet ./plugins/restart ./cmd/containerd/server
 
-      - name: Upload the validated patch
-        uses: actions/upload-artifact@v4
+      - name: Create validated final patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C source diff --binary --full-index > "$GITHUB_WORKSPACE/$FINAL_PATCH"
+          test -s "$GITHUB_WORKSPACE/$FINAL_PATCH"
+          test "$(sha256sum "$GITHUB_WORKSPACE/$FINAL_PATCH" | cut -d' ' -f1)" = "$EXPECTED_PATCH_SHA256"
+          sha256sum "$GITHUB_WORKSPACE/$FINAL_PATCH" | tee "$GITHUB_WORKSPACE/$FINAL_PATCH.sha256"
+
+      - name: Upload validated patch
+        uses: actions/upload-artifact@v7
         with:
-          name: containerd-restart-monitor-candidate
-          path: containerd-restart-monitor-candidate.patch
+          name: containerd-restart-monitor-validated-patch
+          path: |
+            ${{ env.FINAL_PATCH }}
+            ${{ env.FINAL_PATCH }}.sha256
           if-no-files-found: error
+          retention-days: 30
+
+      - name: Record validation summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## containerd restart monitor validation"
+            echo
+            echo "- Upstream SHA: \`$UPSTREAM_SHA\`"
+            echo "- Candidate SHA-256: \`$EXPECTED_PATCH_SHA256\`"
+            echo "- Go directive: \`$(awk '/^go / {print $2; exit}' source/go.mod 2>/dev/null || echo unavailable)\`"
+            echo "- Workflow conclusion: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,6 +1,8 @@
+diff --git a/plugins/restart/monitor.go b/plugins/restart/monitor.go
+index de88a3173ec2ce79be0927f8c6e919b6d17faf99..bb62f103ed5c091b0325209c2879247608505a21 100644
 --- a/plugins/restart/monitor.go
 +++ b/plugins/restart/monitor.go
-@@ -19,6 +19,7 @@
+@@ -19,6 +19,7 @@ package monitor
  import (
  	"context"
  	"fmt"
@@ -8,7 +10,7 @@
  	"strconv"
  	"sync"
  	"time"
-@@ -57,11 +58,10 @@
+@@ -57,11 +58,10 @@ func init() {
  			if err != nil {
  				return nil, err
  			}
@@ -24,7 +26,7 @@
  		},
  		ConfigMigration: func(ctx context.Context, configVersion int, pluginConfigs map[string]any) error {
  			if configVersion >= version.ConfigVersion {
-@@ -83,19 +83,68 @@
+@@ -83,19 +83,69 @@ type change interface {
  	apply(context.Context, *containerd.Client) error
  }
  
@@ -34,16 +36,13 @@
 +
  type monitor struct {
  	client *containerd.Client
--}
--
++	cancel context.CancelFunc
++	done   chan struct{}
+ }
+ 
 -func (m *monitor) run(interval time.Duration) {
 -	if interval == 0 {
 -		interval = 10 * time.Second
--	}
-+	cancel context.CancelFunc
-+	done   chan struct{}
-+}
-+
 +func newMonitor(client *containerd.Client, interval time.Duration) *monitor {
 +	ctx, cancel := context.WithCancel(context.Background())
 +	m := &monitor{
@@ -73,10 +72,7 @@
 +) {
 +	if interval <= 0 {
 +		interval = defaultMonitorInterval
-+	}
-+	ticker := time.NewTicker(interval)
-+	defer ticker.Stop()
-+
+ 	}
  	for {
 -		if err := m.reconcile(context.Background()); err != nil {
 +		select {
@@ -93,14 +89,21 @@
  		}
 -		time.Sleep(interval)
 +
++		// Preserve the original behavior of waiting a full interval after
++		// each reconciliation while still allowing prompt cancellation.
++		timer := time.NewTimer(interval)
 +		select {
 +		case <-ctx.Done():
++			timer.Stop()
 +			return
-+		case <-ticker.C:
++		case <-timer.C:
 +		}
  	}
  }
  
+diff --git a/plugins/restart/monitor_test.go b/plugins/restart/monitor_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d76c79408ca5aad51db141131eea389650b5bf9d
 --- /dev/null
 +++ b/plugins/restart/monitor_test.go
 @@ -0,0 +1,127 @@
