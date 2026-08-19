@@ -7,14 +7,12 @@ on:
     paths:
       - .github/workflows/containerd-restart-monitor-validation.yml
       - oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
-      - oss-validation/containerd-restart-monitor/refine_candidate.py
   pull_request:
     branches:
       - main
     paths:
       - .github/workflows/containerd-restart-monitor-validation.yml
       - oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
-      - oss-validation/containerd-restart-monitor/refine_candidate.py
   workflow_dispatch:
 
 permissions:
@@ -31,7 +29,6 @@ jobs:
     env:
       UPSTREAM_SHA: 4d4d8b0ed29397cf0fc426c8c77a6c03c00d3092
       PATCH_FILE: oss-validation/containerd-restart-monitor/containerd_restart_monitor_lifecycle.patch
-      REFINEMENT_SCRIPT: oss-validation/containerd-restart-monitor/refine_candidate.py
       FINAL_PATCH: containerd_restart_monitor_lifecycle.validated.patch
       CGO_ENABLED: "1"
     steps:
@@ -61,13 +58,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libseccomp-dev pkg-config
 
-      - name: Apply, refine, and format candidate patch
+      - name: Apply and format candidate patch
         shell: bash
         run: |
           set -euo pipefail
           git -C source apply --check "$GITHUB_WORKSPACE/$PATCH_FILE"
           git -C source apply "$GITHUB_WORKSPACE/$PATCH_FILE"
-          python3 "$GITHUB_WORKSPACE/$REFINEMENT_SCRIPT" "$GITHUB_WORKSPACE/source"
           gofmt -w source/plugins/restart/monitor.go source/plugins/restart/monitor_test.go
           git -C source add -N plugins/restart/monitor_test.go
           git -C source diff --check
