@@ -1,0 +1,233 @@
+--- a/plugins/restart/monitor.go
++++ b/plugins/restart/monitor.go
+@@ -19,6 +19,7 @@
+ import (
+ 	"context"
+ 	"fmt"
++	"io"
+ 	"strconv"
+ 	"sync"
+ 	"time"
+@@ -57,11 +58,10 @@
+ 			if err != nil {
+ 				return nil, err
+ 			}
+-			m := &monitor{
+-				client: client,
+-			}
+-			go m.run(tomlext.ToStdTime(ic.Config.(*Config).Interval))
+-			return m, nil
++			return newMonitor(
++				client,
++				tomlext.ToStdTime(ic.Config.(*Config).Interval),
++			), nil
+ 		},
+ 		ConfigMigration: func(ctx context.Context, configVersion int, pluginConfigs map[string]any) error {
+ 			if configVersion >= version.ConfigVersion {
+@@ -83,19 +83,68 @@
+ 	apply(context.Context, *containerd.Client) error
+ }
+ 
++const defaultMonitorInterval = 10 * time.Second
++
++var _ io.Closer = (*monitor)(nil)
++
+ type monitor struct {
+ 	client *containerd.Client
+-}
+-
+-func (m *monitor) run(interval time.Duration) {
+-	if interval == 0 {
+-		interval = 10 * time.Second
+-	}
++	cancel context.CancelFunc
++	done   chan struct{}
++}
++
++func newMonitor(client *containerd.Client, interval time.Duration) *monitor {
++	ctx, cancel := context.WithCancel(context.Background())
++	m := &monitor{
++		client: client,
++		cancel: cancel,
++		done:   make(chan struct{}),
++	}
++	go func() {
++		defer close(m.done)
++		runMonitor(ctx, interval, m.reconcile)
++	}()
++	return m
++}
++
++// Close stops the monitor loop and waits for an in-flight reconciliation to
++// observe cancellation before the plugin is released.
++func (m *monitor) Close() error {
++	m.cancel()
++	<-m.done
++	return nil
++}
++
++func runMonitor(
++	ctx context.Context,
++	interval time.Duration,
++	reconcile func(context.Context) error,
++) {
++	if interval <= 0 {
++		interval = defaultMonitorInterval
++	}
++	ticker := time.NewTicker(interval)
++	defer ticker.Stop()
++
+ 	for {
+-		if err := m.reconcile(context.Background()); err != nil {
++		select {
++		case <-ctx.Done():
++			return
++		default:
++		}
++
++		if err := reconcile(ctx); err != nil {
++			if ctx.Err() != nil {
++				return
++			}
+ 			log.L.WithError(err).Error("reconcile")
+ 		}
+-		time.Sleep(interval)
++
++		select {
++		case <-ctx.Done():
++			return
++		case <-ticker.C:
++		}
+ 	}
+ }
+ 
+--- /dev/null
++++ b/plugins/restart/monitor_test.go
+@@ -0,0 +1,127 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package monitor
++
++import (
++	"context"
++	"testing"
++	"time"
++)
++
++func TestRunMonitorReconcilesImmediately(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	calls := make(chan struct{}, 1)
++	done := make(chan struct{})
++
++	go func() {
++		defer close(done)
++		runMonitor(ctx, time.Hour, func(context.Context) error {
++			calls <- struct{}{}
++			return nil
++		})
++	}()
++
++	select {
++	case <-calls:
++	case <-time.After(time.Second):
++		t.Fatal("initial reconciliation did not run")
++	}
++
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("monitor did not stop after cancellation")
++	}
++}
++
++func TestRunMonitorRepeatsOnInterval(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	calls := make(chan struct{}, 4)
++	done := make(chan struct{})
++
++	go func() {
++		defer close(done)
++		runMonitor(ctx, time.Millisecond, func(context.Context) error {
++			select {
++			case calls <- struct{}{}:
++			default:
++			}
++			return nil
++		})
++	}()
++
++	for range 2 {
++		select {
++		case <-calls:
++		case <-time.After(time.Second):
++			t.Fatal("periodic reconciliation did not run")
++		}
++	}
++
++	cancel()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("monitor did not stop after cancellation")
++	}
++}
++
++func TestRunMonitorPassesCancellationToReconcile(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	entered := make(chan struct{})
++	done := make(chan struct{})
++
++	go func() {
++		defer close(done)
++		runMonitor(ctx, time.Hour, func(ctx context.Context) error {
++			close(entered)
++			<-ctx.Done()
++			return ctx.Err()
++		})
++	}()
++
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("reconciliation did not start")
++	}
++	cancel()
++
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("in-flight reconciliation did not observe cancellation")
++	}
++}
++
++func TestMonitorCloseIsIdempotent(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	done := make(chan struct{})
++	m := &monitor{cancel: cancel, done: done}
++	go func() {
++		<-ctx.Done()
++		close(done)
++	}()
++
++	if err := m.Close(); err != nil {
++		t.Fatalf("first Close() failed: %v", err)
++	}
++	if err := m.Close(); err != nil {
++		t.Fatalf("second Close() failed: %v", err)
++	}
++}
