@@ -78,10 +78,10 @@ swtpm socket --tpm2 --tpmstate dir="$TPMDIR" \
 for _ in $(seq 1 50); do [[ -S "$TPMDIR/swtpm.sock" ]] && break; sleep 0.1; done
 
 FULL_LOG="$LOGS/full-hardware.log"
-timeout 540 "$QEMU_BIN" \
+timeout 600 "$QEMU_BIN" \
   -L "$QEMU_DATA" -no-user-config -nodefaults \
   -machine q35,accel=tcg -cpu max \
-  -smp 8,sockets=2,cores=2,threads=2 -m 3072 \
+  -smp 8,sockets=2,cores=4,threads=1 -m 3072 \
   -object memory-backend-ram,id=mem0,size=1536M \
   -object memory-backend-ram,id=mem1,size=1536M \
   -numa node,nodeid=0,cpus=0-3,memdev=mem0 \
@@ -107,7 +107,7 @@ timeout 540 "$QEMU_BIN" \
   -device virtio-net-pci,netdev=net0,romfile= \
   -chardev socket,id=chrtpm,path="$TPMDIR/swtpm.sock" \
   -tpmdev emulator,id=tpm0,chardev=chrtpm \
-  -device tpm-tis,tpmdev=tpm0 \
+  -device tpm-crb,tpmdev=tpm0 \
   -chardev file,id=serial0,path="$FULL_LOG" \
   -device isa-serial,chardev=serial0 \
   -display none -monitor none -no-reboot || true
