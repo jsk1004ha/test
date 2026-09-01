@@ -14,6 +14,15 @@ fi
 if [[ -z "$QEMU_BIN" ]]; then QEMU_BIN="$(command -v qemu-system-x86_64)"; fi
 chmod +x "$QEMU_BIN"
 
+QEMU_DATA="${QEMU_DATA:-$ROOT/tools/qemu-data}"
+if [[ ! -s "$QEMU_DATA/bios-256k.bin" ]]; then
+  QEMU_DATA=/usr/share/qemu
+fi
+if [[ ! -s "$QEMU_DATA/bios-256k.bin" ]]; then
+  echo "QEMU firmware directory is incomplete: $QEMU_DATA" >&2
+  exit 1
+fi
+
 KERNEL="$OUT/vmlinuz-axiom64"
 INITRD="$OUT/initramfs-axiom64.zst"
 test -s "$KERNEL" && test -s "$INITRD"
@@ -37,7 +46,7 @@ run_core() {
   local cpus="$1"
   local log="$LOGS/core-smp${cpus}.log"
   timeout 300 "$QEMU_BIN" \
-    -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp "$cpus" -m 1536 \
+    -L "$QEMU_DATA" -machine q35,accel=tcg -cpu max -smp "$cpus" -m 1536 \
     -kernel "$KERNEL" -initrd "$INITRD" \
     -append "console=ttyS0,115200n8 rdinit=/sbin/axiom-init axiom.test=core axiom.expected_cpus=$cpus panic=-1 pti=on vsyscall=none randomize_kstack_offset=on slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1" \
     -display none -monitor none -serial "file:$log" -no-reboot || true
@@ -68,7 +77,7 @@ for _ in $(seq 1 50); do [[ -S "$TPMDIR/swtpm.sock" ]] && break; sleep 0.1; done
 
 FULL_LOG="$LOGS/full-hardware.log"
 timeout 540 "$QEMU_BIN" \
-  -L /usr/share/qemu -machine q35,accel=tcg -cpu max \
+  -L "$QEMU_DATA" -machine q35,accel=tcg -cpu max \
   -smp 8,sockets=2,cores=2,threads=2 -m 3072 \
   -object memory-backend-ram,id=mem0,size=1536M \
   -object memory-backend-ram,id=mem1,size=1536M \
@@ -97,7 +106,7 @@ done
 record_pass 'full Q35 hardware and security matrix'
 
 BIOS_LOG="$LOGS/iso-bios.log"
-timeout 360 "$QEMU_BIN" -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
+timeout 360 "$QEMU_BIN" -L "$QEMU_DATA" -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
   -cdrom "$WORK/axiom64-totality-ci.iso" -boot d \
   -display none -monitor none -serial "file:$BIOS_LOG" -no-reboot || true
 require_marker "$BIOS_LOG" 'AXIOM-ISO-QUALIFIED: PASS'
@@ -112,7 +121,7 @@ for p in /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do [[ -f 
 if [[ -z "$OVMF_VARS_SRC" ]]; then echo 'OVMF vars not found' >&2; exit 1; fi
 cp "$OVMF_VARS_SRC" "$WORK/OVMF_VARS.fd"
 UEFI_LOG="$LOGS/iso-uefi.log"
-timeout 360 "$QEMU_BIN" -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
+timeout 360 "$QEMU_BIN" -L "$QEMU_DATA" -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file="$WORK/OVMF_VARS.fd" \
   -cdrom "$WORK/axiom64-totality-ci.iso" -boot d \
@@ -135,6 +144,7 @@ record_pass 'release ZIP integrity'
   echo 'STATUS: PASS'
   echo "PASS_COUNT: $PASS_COUNT"
   echo "QEMU: $($QEMU_BIN --version | head -n1)"
+  echo "QEMU_FIRMWARE: $QEMU_DATA"
   echo 'Profiles: SMP 1/2/4/8, Q35 full hardware, BIOS ISO, UEFI ISO'
 } >> "$REPORT"
 
