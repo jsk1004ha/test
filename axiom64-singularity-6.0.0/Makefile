@@ -6,7 +6,7 @@ NASM := nasm
 QEMU := qemu-system-x86_64
 .RECIPEPREFIX := >
 
-.PHONY: all clean bios uefi host-test model-test proof-test check qualification package
+.PHONY: all clean bios uefi host-test model-test proof-test check qualification package package-only
 
 all: bios uefi $(BUILD)/advanced-harness
 
@@ -68,7 +68,12 @@ check: all host-test model-test proof-test
 qualification: check
 >bash tools/qualification.sh
 
-package: qualification | $(DIST)
+package: qualification
+>$(MAKE) package-only
+
+package-only: | $(DIST)
+>test -f $(BUILD)/qualification-certificate.txt
+>test -f $(BUILD)/artifact-SHA256SUMS.txt
 >rm -rf $(BUILD)/package-root
 >mkdir -p $(BUILD)/package-root/$(PROJECT)/artifacts
 >cp -a Makefile README.md LICENSE src tests tools docs proofs $(BUILD)/package-root/$(PROJECT)/

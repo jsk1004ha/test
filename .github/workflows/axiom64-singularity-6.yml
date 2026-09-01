@@ -32,7 +32,7 @@ jobs:
             sbsigntool swtpm swtpm-tools tpm2-tools \
             python3 python3-z3 python3-virt-firmware zip unzip
 
-      - name: Build, prove, boot and attest
+      - name: Compile BIOS, UEFI and assembly subsystems
         working-directory: axiom64-singularity-6.0.0
         env:
           LC_ALL: C
@@ -40,8 +40,39 @@ jobs:
           SOURCE_DATE_EPOCH: '0'
         run: |
           chmod +x tools/qualification.sh tests/model.py tests/prove.py tools/check.py
-          make clean
-          make QEMU=qemu-system-x86_64 package
+          make clean all
+
+      - name: Execute native assembly subsystem tests
+        working-directory: axiom64-singularity-6.0.0
+        run: make host-test
+
+      - name: Explore bounded architecture state space
+        working-directory: axiom64-singularity-6.0.0
+        run: make model-test
+
+      - name: Prove symbolic subsystem invariants
+        working-directory: axiom64-singularity-6.0.0
+        run: make proof-test
+
+      - name: Validate binaries and release structure
+        working-directory: axiom64-singularity-6.0.0
+        run: |
+          python3 tools/check.py --build build | tee build/structural-report.txt
+          grep -q 'status: PASS' build/structural-report.txt
+
+      - name: Boot BIOS and authenticated UEFI paths and attest TPM state
+        working-directory: axiom64-singularity-6.0.0
+        env:
+          QEMU: qemu-system-x86_64
+        run: bash tools/qualification.sh
+
+      - name: Package qualified release
+        working-directory: axiom64-singularity-6.0.0
+        env:
+          LC_ALL: C
+          TZ: UTC
+          SOURCE_DATE_EPOCH: '0'
+        run: make package-only
 
       - name: Upload qualified release and evidence
         uses: actions/upload-artifact@v4
