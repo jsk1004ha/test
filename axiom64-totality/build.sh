@@ -77,18 +77,20 @@ cp "$KERNEL_SRC" "$OUT/vmlinuz-axiom64"
 rm -f "$ROOTFS/boot/vmlinuz-virt" "$ROOTFS/boot/initramfs-virt"
 
 # Build the initramfs in two explicit stages and exclude sockets/pseudo-fs
-# contents. Any cpio diagnostic is printed before the build is allowed to fail.
+# contents. Root executes cpio so deliberately unreadable setuid helpers keep
+# their restrictive mode rather than being weakened merely for packaging.
 if ! (
   cd "$ROOTFS"
   find . -xdev \
     \( -path './proc/*' -o -path './sys/*' -o -path './dev/*' -o -path './run/*' -o -path './tmp/*' \) -prune -o \
     ! -type s -print0 \
     | LC_ALL=C sort -z \
-    | cpio --null -o --format=newc --owner=0:0 --quiet > "$WORK/initramfs.cpio" 2> "$OUT/cpio.log"
+    | sudo cpio --null -o --format=newc --owner=0:0 --quiet > "$WORK/initramfs.cpio" 2> "$OUT/cpio.log"
 ); then
   cat "$OUT/cpio.log" >&2 || true
   exit 1
 fi
+sudo chown "$(id -u):$(id -g)" "$WORK/initramfs.cpio"
 zstd -15 -T0 -f "$WORK/initramfs.cpio" -o "$OUT/initramfs-axiom64.zst"
 rm -f "$WORK/initramfs.cpio"
 
