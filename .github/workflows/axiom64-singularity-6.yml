@@ -1,0 +1,56 @@
+name: Axiom64 Singularity 6 qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - axiom64-singularity-6-20260901
+    paths:
+      - 'axiom64-singularity-6.0.0/**'
+      - '.github/workflows/axiom64-singularity-6.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install assembler, firmware, emulator and TPM toolchain
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            nasm lld binutils gcc make qemu-system-x86 ovmf mtools \
+            sbsigntool swtpm swtpm-tools tpm2-tools \
+            python3 python3-z3 python3-virt-firmware zip unzip
+
+      - name: Build, prove, boot and attest
+        working-directory: axiom64-singularity-6.0.0
+        env:
+          LC_ALL: C
+          TZ: UTC
+          SOURCE_DATE_EPOCH: '0'
+        run: |
+          chmod +x tools/qualification.sh tests/model.py tests/prove.py tools/check.py
+          make clean
+          make QEMU=qemu-system-x86_64 package
+
+      - name: Upload qualified release and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: Axiom64-Singularity-6.0.0-qualified
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          path: |
+            axiom64-singularity-6.0.0/dist/*
+            axiom64-singularity-6.0.0/build/*-report.txt
+            axiom64-singularity-6.0.0/build/qemu-*.log
+            axiom64-singularity-6.0.0/build/tpm-*.log
+            axiom64-singularity-6.0.0/build/tpm-*.txt
+            axiom64-singularity-6.0.0/build/quote.*
+            axiom64-singularity-6.0.0/build/ak.pub.pem
