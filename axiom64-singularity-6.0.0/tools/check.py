@@ -84,6 +84,8 @@ def main() -> None:
         b"GOP: PRESENT",
         b"TCG2: PRESENT",
         b"TPM2_GET_RANDOM: PASS",
+        b"EXIT_BOOT_SERVICES: PASS",
+        b"POST_FIRMWARE_KERNEL_OWNERSHIP: PASS",
         b"UEFI_QUALIFICATION_COMPLETE: PASS",
     ):
         checks.require(marker in uefi, f"UEFI image embeds marker: {marker.decode()}")
@@ -122,30 +124,15 @@ def main() -> None:
         text=True,
     ).stdout
     required_symbols = (
-        "ax_cap_derive",
-        "ax_x2apic_icr",
-        "ax_smp_pick_cpu",
-        "ax_numa_pick_node",
-        "ax_hotplug_transition",
-        "ax_vtd_context",
-        "ax_dma_window_contains",
-        "ax_pcie_ecam_address",
-        "ax_nvme_identify",
-        "ax_xhci_trb",
-        "ax_usb_setup_packet",
-        "ax_virtio_desc",
-        "ax_elf64_validate",
-        "ax_linux_syscall_map",
-        "ax_kaslr_choose",
-        "ax_kpti_cr3",
-        "ax_cet_policy",
-        "ax_mpk_mask",
-        "ax_page_table_entry",
-        "ax_fat32_next",
-        "ax_ext2_dirent_valid",
-        "ax_ipv4_checksum",
-        "ax_iommu_bdf_allowed",
-        "ax_framebuffer_offset",
+        "ax_cap_derive", "ax_cap_has", "ax_x2apic_icr", "ax_smp_pick_cpu",
+        "ax_numa_pick_node", "ax_hotplug_transition", "ax_vtd_context",
+        "ax_dma_window_contains", "ax_pcie_ecam_address", "ax_nvme_identify",
+        "ax_nvme_sq_advance", "ax_xhci_trb", "ax_usb_setup_packet",
+        "ax_virtio_desc", "ax_elf64_validate", "ax_linux_syscall_map",
+        "ax_kaslr_choose", "ax_kpti_cr3", "ax_cet_policy", "ax_mpk_mask",
+        "ax_page_table_entry", "ax_fat32_next", "ax_ext2_dirent_valid",
+        "ax_ipv4_checksum", "ax_tcp_seq_before", "ax_iommu_bdf_allowed",
+        "ax_framebuffer_offset", "ax_ring_advance",
     )
     for symbol in required_symbols:
         checks.require(symbol in nm, f"advanced assembly exports {symbol}")

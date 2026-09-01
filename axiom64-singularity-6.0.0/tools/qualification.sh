@@ -15,6 +15,10 @@ require_marker() {
   grep -aFq "$marker" "$file" || fail "missing '$marker' in $file"
 }
 
+run_tpm() {
+  timeout 25s "$@"
+}
+
 find_ovmf_pair() {
   local candidates=(
     "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd:/usr/share/OVMF/OVMF_VARS_4M.fd"
@@ -40,8 +44,7 @@ OVMF_VARS_TEMPLATE=${OVMF[1]}
 sbverify --cert "$BUILD/db.crt" "$BUILD/BOOTX64.SIGNED.EFI" \
   >"$BUILD/sbverify.log" 2>&1
 
-# Enroll the exact development certificate into PK/KEK/db and switch the
-# copied OVMF variable store into Secure Boot user mode.
+# Enroll the exact development certificate into an isolated PK/KEK/db store.
 if ! virt-fw-vars \
     --input "$OVMF_VARS_TEMPLATE" \
     --output "$BUILD/OVMF_VARS.secboot.fd" \
@@ -64,7 +67,7 @@ virt-fw-vars --input "$BUILD/OVMF_VARS.secboot.fd" --print --verbose \
 
 # BIOS transition test.
 set +e
-timeout 30s "$QEMU" \
+timeout -k 5s 30s "$QEMU" \
   -machine pc,accel=tcg \
   -cpu max \
   -m 128M \
@@ -77,14 +80,47 @@ timeout 30s "$QEMU" \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04
 BIOS_RC=$?
 set -e
-[[ $BIOS_RC -ne 124 ]] || fail "BIOS QEMU run timed out"
+[[ $BIOS_RC -ne 124 && $BIOS_RC -ne 137 ]] || fail "BIOS QEMU run timed out"
 require_marker "$BUILD/qemu-bios.log" "BIOS_BOOT: PASS"
 require_marker "$BUILD/qemu-bios.log" "LONG_MODE: PASS"
 require_marker "$BUILD/qemu-bios.log" "CPU_HARDENING_SCAN: PASS"
 require_marker "$BUILD/qemu-bios.log" "BIOS_QUALIFICATION_COMPLETE: PASS"
 
-# A TCP swtpm exposes a TPM command port for tpm2-tools and a control port for
-# QEMU's tpm-emulator backend. QEMU and the quote tools use it sequentially.
+# Prove that firmware enforcement rejects a one-byte mutation of the signed
+# image before our EFI entry point can emit its first marker.
+cp "$BUILD/BOOTX64.SIGNED.EFI" "$BUILD/BOOTX64.TAMPERED.EFI"
+python3 - "$BUILD/BOOTX64.TAMPERED.EFI" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+data = bytearray(p.read_bytes())
+index = min(1024, len(data) // 3)
+data[index] ^= 0x01
+p.write_bytes(data)
+PY
+cp "$BUILD/esp.img" "$BUILD/esp-tampered.img"
+mcopy -o -i "$BUILD/esp-tampered.img" "$BUILD/BOOTX64.TAMPERED.EFI" ::/EFI/BOOT/BOOTX64.EFI
+cp "$BUILD/OVMF_VARS.secboot.fd" "$BUILD/OVMF_VARS.tamper.fd"
+set +e
+timeout -k 5s 15s "$QEMU" \
+  -machine q35,smm=on,accel=tcg \
+  -global driver=cfi.pflash01,property=secure,value=on \
+  -cpu max -m 256M \
+  -drive if=pflash,format=raw,unit=0,readonly=on,file="$OVMF_CODE" \
+  -drive if=pflash,format=raw,unit=1,file="$BUILD/OVMF_VARS.tamper.fd" \
+  -drive if=virtio,format=raw,file="$BUILD/esp-tampered.img" \
+  -boot c -vga std -display none \
+  -serial file:"$BUILD/qemu-uefi-tamper.log" \
+  -monitor none -net none -no-reboot \
+  -device isa-debug-exit,iobase=0xf4,iosize=0x04
+TAMPER_RC=$?
+set -e
+if grep -aFq "UEFI_BOOT: PASS" "$BUILD/qemu-uefi-tamper.log"; then
+  fail "tampered EFI image reached efi_main under Secure Boot"
+fi
+
+# Start a TPM 2.0 instance. Port 2322 is QEMU's control channel; port 2321 is
+# used sequentially by tpm2-tools after QEMU exits.
 TPM_DIR="$BUILD/swtpm-state"
 rm -rf "$TPM_DIR"
 mkdir -p "$TPM_DIR"
@@ -106,9 +142,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# UEFI Secure Boot + GOP + TCG2 + TPM command test.
+# Valid signed UEFI path: Secure Boot, GOP, TCG2, TPM command, memory map and
+# ExitBootServices. isa-debug-exit is reached only after firmware ownership is
+# relinquished and the post-firmware kernel path is active.
 set +e
-timeout 60s "$QEMU" \
+timeout -k 5s 60s "$QEMU" \
   -machine q35,smm=on,accel=tcg \
   -global driver=cfi.pflash01,property=secure,value=on \
   -cpu max \
@@ -125,36 +163,37 @@ timeout 60s "$QEMU" \
   -chardev socket,id=chrtpm,host=127.0.0.1,port=2322 \
   -tpmdev emulator,id=tpm0,chardev=chrtpm \
   -device tpm-tis,tpmdev=tpm0 \
-  -no-reboot
+  -no-reboot \
+  -device isa-debug-exit,iobase=0xf4,iosize=0x04
 UEFI_RC=$?
 set -e
-[[ $UEFI_RC -ne 124 ]] || fail "UEFI QEMU run timed out"
+[[ $UEFI_RC -ne 124 && $UEFI_RC -ne 137 ]] || fail "UEFI QEMU run timed out"
 require_marker "$BUILD/qemu-uefi-secure.log" "UEFI_BOOT: PASS"
 require_marker "$BUILD/qemu-uefi-secure.log" "SECURE_BOOT: ENABLED"
 require_marker "$BUILD/qemu-uefi-secure.log" "GOP: PRESENT"
 require_marker "$BUILD/qemu-uefi-secure.log" "TCG2: PRESENT"
 require_marker "$BUILD/qemu-uefi-secure.log" "TPM2_GET_RANDOM: PASS"
+require_marker "$BUILD/qemu-uefi-secure.log" "EXIT_BOOT_SERVICES: PASS"
+require_marker "$BUILD/qemu-uefi-secure.log" "POST_FIRMWARE_KERNEL_OWNERSHIP: PASS"
 require_marker "$BUILD/qemu-uefi-secure.log" "UEFI_QUALIFICATION_COMPLETE: PASS"
 
-# Bind the signed EFI artifact hash into PCR 14 and produce a nonce-qualified
-# TPM quote whose signature and PCR bundle are independently checked.
+# Bind the signed artifact to PCR14 and verify a nonce-qualified quote.
 export TPM2TOOLS_TCTI="swtpm:host=127.0.0.1,port=2321"
-tpm2_startup -c >"$BUILD/tpm-startup.log" 2>&1 || true
+run_tpm tpm2_startup -c >"$BUILD/tpm-startup.log" 2>&1 || true
 EFI_SHA=$(sha256sum "$BUILD/BOOTX64.SIGNED.EFI" | awk '{print $1}')
-tpm2_pcrextend "14:sha256=$EFI_SHA" >"$BUILD/tpm-pcr-extend.log" 2>&1
-tpm2_pcrread sha256:14 >"$BUILD/tpm-pcr14.txt" 2>&1
-tpm2_getrandom 16 -o "$BUILD/tpm-host-random.bin" >"$BUILD/tpm-getrandom.log" 2>&1
-
-tpm2_createprimary -C e -g sha256 -G rsa -c "$BUILD/primary.ctx" \
+run_tpm tpm2_pcrextend "14:sha256=$EFI_SHA" >"$BUILD/tpm-pcr-extend.log" 2>&1
+run_tpm tpm2_pcrread sha256:14 >"$BUILD/tpm-pcr14.txt" 2>&1
+run_tpm tpm2_getrandom 16 -o "$BUILD/tpm-host-random.bin" >"$BUILD/tpm-getrandom.log" 2>&1
+run_tpm tpm2_createprimary -C e -g sha256 -G rsa -c "$BUILD/primary.ctx" \
   >"$BUILD/tpm-createprimary.log" 2>&1
-tpm2_createak -C "$BUILD/primary.ctx" -c "$BUILD/ak.ctx" -G rsa \
+run_tpm tpm2_createak -C "$BUILD/primary.ctx" -c "$BUILD/ak.ctx" -G rsa \
   -g sha256 -s rsassa -u "$BUILD/ak.pub.pem" -f pem -n "$BUILD/ak.name" \
   >"$BUILD/tpm-createak.log" 2>&1
 NONCE=${EFI_SHA:0:32}
-tpm2_quote -c "$BUILD/ak.ctx" -l sha256:14 -q "$NONCE" \
+run_tpm tpm2_quote -c "$BUILD/ak.ctx" -l sha256:14 -q "$NONCE" \
   -m "$BUILD/quote.msg" -s "$BUILD/quote.sig" -o "$BUILD/quote.pcrs" -g sha256 \
   >"$BUILD/tpm-quote.log" 2>&1
-tpm2_checkquote -u "$BUILD/ak.pub.pem" -m "$BUILD/quote.msg" \
+run_tpm tpm2_checkquote -u "$BUILD/ak.pub.pem" -m "$BUILD/quote.msg" \
   -s "$BUILD/quote.sig" -f "$BUILD/quote.pcrs" -g sha256 -q "$NONCE" \
   >"$BUILD/tpm-checkquote.log" 2>&1
 
@@ -163,14 +202,19 @@ tpm2_checkquote -u "$BUILD/ak.pub.pem" -m "$BUILD/quote.msg" \
   echo "status: PASS"
   echo "qualification date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "BIOS QEMU return code: $BIOS_RC"
-  echo "UEFI QEMU return code: $UEFI_RC"
+  echo "tampered UEFI QEMU return code: $TAMPER_RC"
+  echo "valid UEFI QEMU return code: $UEFI_RC"
   echo "OVMF code: $OVMF_CODE"
   echo "OVMF vars template: $OVMF_VARS_TEMPLATE"
   echo "Secure Boot signed EFI SHA-256: $EFI_SHA"
-  echo "Secure Boot firmware enforcement: PASS"
+  echo "Secure Boot valid-image enforcement: PASS"
+  echo "Secure Boot one-byte tamper rejection: PASS"
   echo "GOP protocol discovery: PASS"
   echo "TCG2 protocol discovery: PASS"
   echo "TPM2 GetRandom through UEFI TCG2: PASS"
+  echo "UEFI memory-map acquisition: PASS"
+  echo "ExitBootServices transition: PASS"
+  echo "post-firmware kernel ownership: PASS"
   echo "TPM PCR14 artifact extension: PASS"
   echo "TPM nonce-qualified quote verification: PASS"
   echo "BIOS long-mode transition: PASS"
@@ -185,11 +229,13 @@ sha256sum \
   "$BUILD/axiom64-singularity-6-bios.img" \
   "$BUILD/BOOTX64.EFI" \
   "$BUILD/BOOTX64.SIGNED.EFI" \
+  "$BUILD/BOOTX64.TAMPERED.EFI" \
   "$BUILD/esp.img" \
   "$BUILD/host-assembly-report.txt" \
   "$BUILD/model-report.txt" \
   "$BUILD/proof-report.txt" \
   "$BUILD/qemu-bios.log" \
+  "$BUILD/qemu-uefi-tamper.log" \
   "$BUILD/qemu-uefi-secure.log" \
   "$BUILD/quote.msg" \
   "$BUILD/quote.sig" \

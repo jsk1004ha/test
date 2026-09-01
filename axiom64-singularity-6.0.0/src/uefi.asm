@@ -1,7 +1,8 @@
-; Axiom64 Singularity 6.0.0 UEFI x86-64 qualification image
+; Axiom64 Singularity 6.0.0 UEFI x86-64 qualification kernel
 ; Pure NASM assembly using the Microsoft x64 ABI required by UEFI.
-; It verifies firmware Secure Boot state, discovers GOP and TCG2, and submits
-; a TPM2_GetRandom command through EFI_TCG2_PROTOCOL before orderly shutdown.
+; Firmware Secure Boot authenticates this image. It verifies SecureBoot state,
+; discovers GOP and TCG2, issues TPM2_GetRandom, obtains the UEFI memory map,
+; exits boot services, and continues as the post-firmware kernel owner.
 
 BITS 64
 DEFAULT REL
@@ -11,28 +12,33 @@ GLOBAL efi_main
 COM1                    equ 0x3F8
 ST_RUNTIME_SERVICES     equ 88
 ST_BOOT_SERVICES        equ 96
-BS_STALL                equ 248
+BS_GET_MEMORY_MAP       equ 56
 BS_LOCATE_PROTOCOL      equ 320
+BS_EXIT_BOOT_SERVICES   equ 232
 RT_GET_VARIABLE         equ 72
-RT_RESET_SYSTEM         equ 104
 TCG2_GET_CAPABILITY     equ 0
 TCG2_SUBMIT_COMMAND     equ 24
-EFI_RESET_SHUTDOWN      equ 2
 TPM_COMMAND_SIZE        equ 12
 TPM_RESPONSE_SIZE       equ 128
+MEMORY_MAP_CAPACITY     equ 65536
 
 SECTION .text
 
 efi_main:
-    ; Entry RSP is 8 mod 16. Five nonvolatile pushes leave it 16-byte aligned
-    ; at each call site once the required shadow space is allocated.
+    ; UEFI enters with RSP=8 mod 16. Nine pushes make every subsequent external
+    ; call site 16-byte aligned before allocating shadow space.
     push rbp
+    push rbx
+    push rsi
+    push rdi
     push r12
     push r13
     push r14
     push r15
-    mov rbp, rsp
+    push r11
+    cld
 
+    mov rbx, rcx                    ; EFI image handle
     mov r13, rdx                    ; EFI_SYSTEM_TABLE *
     mov r14, [r13 + ST_RUNTIME_SERVICES]
     mov r12, [r13 + ST_BOOT_SERVICES]
@@ -47,7 +53,7 @@ efi_main:
     mov qword [secure_size], 1
     mov dword [secure_attributes], 0
     mov byte [secure_value], 0
-    sub rsp, 48                     ; 32-byte shadow + fifth arg + padding
+    sub rsp, 48
     lea rax, [secure_value]
     mov [rsp + 32], rax
     lea rcx, [secure_boot_name]
@@ -68,8 +74,7 @@ efi_main:
     call serial_puts
 .secure_boot_done:
 
-    ; Locate the Graphics Output Protocol. This is the graphics-driver handoff
-    ; used by the compositor/GPU service in the full architecture.
+    ; Firmware graphics handoff discovery.
     mov qword [gop_interface], 0
     sub rsp, 32
     lea rcx, [gop_guid]
@@ -89,7 +94,7 @@ efi_main:
     call serial_puts
 .gop_done:
 
-    ; Locate EFI_TCG2_PROTOCOL and ask firmware for TPM capability data.
+    ; Locate EFI_TCG2_PROTOCOL and query TPM capability data.
     mov qword [tcg2_interface], 0
     sub rsp, 32
     lea rcx, [tcg2_guid]
@@ -114,12 +119,11 @@ efi_main:
     lea rsi, [msg_tcg2_present]
     call serial_puts
 
-    ; Submit TPM2_GetRandom(bytesRequested=16), big-endian TPM wire format.
+    ; TPM_ST_NO_SESSIONS TPM2_GetRandom(bytesRequested=16).
     lea rdi, [tpm_response]
     xor eax, eax
     mov ecx, TPM_RESPONSE_SIZE / 8
     rep stosq
-
     sub rsp, 48
     lea rax, [tpm_response]
     mov [rsp + 32], rax
@@ -131,9 +135,9 @@ efi_main:
     add rsp, 48
     test rax, rax
     jnz .tpm_random_fail
-    cmp dword [tpm_response + 6], 0   ; responseCode is all-zero on success
+    cmp dword [tpm_response + 6], 0
     jne .tpm_random_fail
-    cmp word [tpm_response + 10], 0   ; TPM2B_DIGEST size must be non-zero
+    cmp word [tpm_response + 10], 0
     je .tpm_random_fail
     lea rsi, [msg_tpm_random_pass]
     call serial_puts
@@ -147,29 +151,69 @@ efi_main:
     call serial_puts
 .tcg2_done:
 
+    ; The final firmware-to-kernel ownership transfer. GetMemoryMap and
+    ; ExitBootServices are adjacent so no intervening firmware allocation can
+    ; invalidate the map key. Retry handles a racing map-key change.
+    call leave_firmware
+    test rax, rax
+    jnz .exit_failed
+
+    lea rsi, [msg_exit_pass]
+    call serial_puts
+    lea rsi, [msg_kernel_owner]
+    call serial_puts
     lea rsi, [msg_complete]
     call serial_puts
+    mov al, 0x20
+    out 0xF4, al
+.kernel_halt:
+    cli
+    hlt
+    jmp .kernel_halt
 
-    ; Give the serial backend time to drain before ResetSystem.
+.exit_failed:
+    lea rsi, [msg_exit_fail]
+    call serial_puts
+    mov al, 0x21
+    out 0xF4, al
+    jmp .kernel_halt
+
+leave_firmware:
+    push rbp
+    mov ebp, 4
+.retry:
+    mov qword [memory_map_size], MEMORY_MAP_CAPACITY
+    mov qword [memory_map_key], 0
+    mov qword [memory_descriptor_size], 0
+    mov dword [memory_descriptor_version], 0
+
+    sub rsp, 48
+    lea rax, [memory_descriptor_version]
+    mov [rsp + 32], rax
+    lea rcx, [memory_map_size]
+    lea rdx, [memory_map]
+    lea r8, [memory_map_key]
+    lea r9, [memory_descriptor_size]
+    call qword [r12 + BS_GET_MEMORY_MAP]
+    add rsp, 48
+    test rax, rax
+    jnz .failed
+
     sub rsp, 32
-    mov ecx, 100000
-    call qword [r12 + BS_STALL]
+    mov rcx, rbx
+    mov rdx, [memory_map_key]
+    call qword [r12 + BS_EXIT_BOOT_SERVICES]
     add rsp, 32
-
-    sub rsp, 32
-    mov ecx, EFI_RESET_SHUTDOWN
-    xor edx, edx
-    xor r8d, r8d
-    xor r9d, r9d
-    call qword [r14 + RT_RESET_SYSTEM]
-    add rsp, 32
-
+    test rax, rax
+    jz .success
+    dec ebp
+    jnz .retry
+.failed:
+    mov rax, -1
+    pop rbp
+    ret
+.success:
     xor eax, eax
-    mov rsp, rbp
-    pop r15
-    pop r14
-    pop r13
-    pop r12
     pop rbp
     ret
 
@@ -181,13 +225,13 @@ serial_init:
     mov al, 0x80
     out dx, al
     mov dx, COM1
-    mov al, 1                       ; 115200 baud divisor
+    mov al, 1
     out dx, al
     mov dx, COM1 + 1
     xor al, al
     out dx, al
     mov dx, COM1 + 3
-    mov al, 0x03                    ; 8N1
+    mov al, 0x03
     out dx, al
     mov dx, COM1 + 2
     mov al, 0xC7
@@ -224,22 +268,19 @@ serial_puts:
 SECTION .rdata
 ALIGN 8
 
-; EFI_GLOBAL_VARIABLE = 8BE4DF61-93CA-11D2-AA0D-00E098032B8C
- efi_global_variable_guid:
+efi_global_variable_guid:
     dd 0x8BE4DF61
     dw 0x93CA
     dw 0x11D2
     db 0xAA,0x0D,0x00,0xE0,0x98,0x03,0x2B,0x8C
 
-; EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID = 9042A9DE-23DC-4A38-96FB-7ADED080516A
- gop_guid:
+gop_guid:
     dd 0x9042A9DE
     dw 0x23DC
     dw 0x4A38
     db 0x96,0xFB,0x7A,0xDE,0xD0,0x80,0x51,0x6A
 
-; EFI_TCG2_PROTOCOL_GUID = 607F766C-7455-42BE-930B-E4D76DB2720F
- tcg2_guid:
+tcg2_guid:
     dd 0x607F766C
     dw 0x7455
     dw 0x42BE
@@ -248,11 +289,10 @@ ALIGN 8
 secure_boot_name:
     dw 'S','e','c','u','r','e','B','o','o','t',0
 
-; TPM_ST_NO_SESSIONS, size 12, TPM_CC_GetRandom, requested bytes 16.
 tpm_getrandom_command:
     db 0x80,0x01, 0x00,0x00,0x00,0x0C, 0x00,0x00,0x01,0x7B, 0x00,0x10
 
-msg_banner: db 13,10,'Axiom64 Singularity 6.0.0 / UEFI measured qualification path',13,10,0
+msg_banner: db 13,10,'Axiom64 Singularity 6.0.0 / authenticated UEFI kernel path',13,10,0
 msg_uefi: db 'UEFI_BOOT: PASS',13,10,0
 msg_secure_enabled: db 'SECURE_BOOT: ENABLED',13,10,0
 msg_secure_disabled: db 'SECURE_BOOT: DISABLED_OR_UNREADABLE',13,10,0
@@ -262,6 +302,9 @@ msg_tcg2_present: db 'TCG2: PRESENT',13,10,0
 msg_tcg2_absent: db 'TCG2: ABSENT',13,10,0
 msg_tpm_random_pass: db 'TPM2_GET_RANDOM: PASS',13,10,0
 msg_tpm_random_fail: db 'TPM2_GET_RANDOM: FAIL',13,10,0
+msg_exit_pass: db 'EXIT_BOOT_SERVICES: PASS',13,10,0
+msg_exit_fail: db 'EXIT_BOOT_SERVICES: FAIL',13,10,0
+msg_kernel_owner: db 'POST_FIRMWARE_KERNEL_OWNERSHIP: PASS',13,10,0
 msg_complete: db 'UEFI_QUALIFICATION_COMPLETE: PASS',13,10,0
 
 SECTION .data
@@ -276,3 +319,10 @@ ALIGN 16
 tcg2_capability: times 64 db 0
 ALIGN 16
 tpm_response: times TPM_RESPONSE_SIZE db 0
+ALIGN 16
+memory_map_size: dq MEMORY_MAP_CAPACITY
+memory_map_key: dq 0
+memory_descriptor_size: dq 0
+memory_descriptor_version: dd 0
+ALIGN 16
+memory_map: times MEMORY_MAP_CAPACITY db 0
