@@ -18,19 +18,48 @@ echo /sbin/mdev > /proc/sys/kernel/hotplug
 mdev -s
 hostname axiom64-totality
 
-for module in virtio_pci virtio_blk virtio_net nvme ahci libahci xhci_pci usbhid hid_generic tpm_tis tpm_crb virtio_gpu snd_hda_intel loop dm_mod dm_crypt overlay btrfs xfs wireguard; do
+# Load complete dependency stacks explicitly.  In a tiny immutable system there
+# is no full userspace device manager to infer every late dependency for us.
+for module in \
+    virtio virtio_ring virtio_pci virtio_blk virtio_net \
+    scsi_mod sd_mod sg sr_mod \
+    nvme_core nvme \
+    libata libahci ahci \
+    usbcore xhci_hcd xhci_pci hid usbhid hid_generic usbkbd usbmouse \
+    drm drm_kms_helper virtio_gpu \
+    snd snd_timer snd_pcm snd_hda_codec snd_hda_codec_generic snd_hda_intel \
+    tpm tpm_tis_core tpm_tis tpm_crb \
+    loop dm_mod dm_crypt dm_verity \
+    md_mod raid1 raid10 \
+    overlay btrfs xfs ext4 \
+    wireguard tun bridge br_netfilter nf_tables; do
     modprobe "$module" 2>/dev/null || true
 done
+
+# Re-scan after asynchronous PCI/ACPI probing and again after a brief settle
+# period so devtmpfs/mdev nodes exist before the qualification program runs.
 mdev -s
+for _ in 1 2 3 4 5; do
+    [ -b /dev/vda ] && [ -b /dev/nvme0n1 ] && \
+      { [ -b /dev/sda ] || [ -b /dev/sdb ]; } && \
+      { [ -c /dev/tpmrm0 ] || [ -c /dev/tpm0 ]; } && break
+    sleep 1
+    mdev -s 2>/dev/null || true
+done
 
 sysctl -w kernel.kptr_restrict=2 >/dev/null 2>&1 || true
 sysctl -w kernel.dmesg_restrict=1 >/dev/null 2>&1 || true
 sysctl -w kernel.unprivileged_bpf_disabled=1 >/dev/null 2>&1 || true
+sysctl -w kernel.yama.ptrace_scope=2 >/dev/null 2>&1 || true
 sysctl -w fs.protected_hardlinks=1 >/dev/null 2>&1 || true
 sysctl -w fs.protected_symlinks=1 >/dev/null 2>&1 || true
+sysctl -w fs.protected_fifos=2 >/dev/null 2>&1 || true
+sysctl -w fs.protected_regular=2 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.all.accept_redirects=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv6.conf.all.accept_redirects=0 >/dev/null 2>&1 || true
 
 ip link set lo up 2>/dev/null || true
 for path in /sys/class/net/*; do
