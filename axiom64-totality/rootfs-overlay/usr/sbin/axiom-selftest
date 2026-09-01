@@ -8,7 +8,40 @@ FAILURES=0
 pass() { echo "$1: PASS"; }
 fail() { echo "$1: FAIL${2:+ — $2}"; FAILURES=$((FAILURES+1)); }
 check_cmd() { command -v "$1" >/dev/null 2>&1 && pass "COMMAND-$1" || fail "COMMAND-$1"; }
-waitdev() { i=0; while [ "$i" -lt 100 ]; do [ -b "$1" ] && return 0; sleep 0.1; i=$((i+1)); done; return 1; }
+
+settle_devices() {
+    mdev -s 2>/dev/null || true
+    sleep 0.1
+}
+
+wait_block_label() {
+    label=$1
+    i=0
+    while [ "$i" -lt 300 ]; do
+        dev=$(blkid -L "$label" 2>/dev/null || true)
+        if [ -n "$dev" ] && [ -b "$dev" ]; then
+            echo "$dev"
+            return 0
+        fi
+        if [ $((i % 10)) -eq 0 ]; then settle_devices; fi
+        sleep 0.1
+        i=$((i+1))
+    done
+    return 1
+}
+
+wait_char_any() {
+    i=0
+    while [ "$i" -lt 300 ]; do
+        for dev in "$@"; do
+            if [ -c "$dev" ]; then echo "$dev"; return 0; fi
+        done
+        if [ $((i % 10)) -eq 0 ]; then settle_devices; fi
+        sleep 0.1
+        i=$((i+1))
+    done
+    return 1
+}
 
 CPUS=$(nproc 2>/dev/null || echo 1)
 echo "CPU-COUNT: $CPUS"
@@ -34,9 +67,13 @@ if [ "$MODE" = full ]; then
     [ -d /sys/devices/system/node/node1 ] && pass NUMA || fail NUMA
     if [ -d /sys/kernel/iommu_groups ] && find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 | grep -q .; then pass IOMMU; else fail IOMMU; fi
 
-    waitdev /dev/vda || fail VIRTIO-BLK 'device absent'
-    waitdev /dev/nvme0n1 || fail NVME 'device absent'
-    waitdev /dev/sda || fail AHCI 'device absent'
+    VIRTIO_DEV=$(wait_block_label AXIOM_VIRTIO || true)
+    NVME_DEV=$(wait_block_label AXIOM_NVME || true)
+    AHCI_DEV=$(wait_block_label AXIOM_AHCI || true)
+
+    [ -n "$VIRTIO_DEV" ] || fail VIRTIO-BLK 'device absent'
+    [ -n "$NVME_DEV" ] || fail NVME 'device absent'
+    [ -n "$AHCI_DEV" ] || fail AHCI 'device absent'
 
     test_disk() {
         dev=$1
@@ -54,13 +91,25 @@ if [ "$MODE" = full ]; then
             umount "$mp"
         else fail "$marker" 'mount'; fi
     }
-    [ -b /dev/vda ] && test_disk /dev/vda AXIOM_VIRTIO VIRTIO-BLK
-    [ -b /dev/nvme0n1 ] && test_disk /dev/nvme0n1 AXIOM_NVME NVME
-    [ -b /dev/sda ] && test_disk /dev/sda AXIOM_AHCI AHCI
+    [ -n "$VIRTIO_DEV" ] && test_disk "$VIRTIO_DEV" AXIOM_VIRTIO VIRTIO-BLK
+    [ -n "$NVME_DEV" ] && test_disk "$NVME_DEV" AXIOM_NVME NVME
+    [ -n "$AHCI_DEV" ] && test_disk "$AHCI_DEV" AXIOM_AHCI AHCI
 
-    if [ -c /dev/tpm0 ] || [ -c /dev/tpmrm0 ]; then
-        if tpm2_getrandom 16 >/tmp/tpm.random 2>/tmp/tpm.err && [ "$(wc -c </tmp/tpm.random)" -ge 16 ]; then pass TPM2; else fail TPM2; fi
-    else fail TPM2 'device absent'; fi
+    TPM_DEV=$(wait_char_any /dev/tpmrm0 /dev/tpm0 || true)
+    if [ -n "$TPM_DEV" ]; then
+        tpm2_startup -c >/tmp/tpm-startup.out 2>/tmp/tpm-startup.err || true
+        if tpm2_getrandom 32 >/tmp/tpm.random 2>/tmp/tpm.err && \
+           [ "$(wc -c </tmp/tpm.random)" -ge 32 ] && \
+           tpm2_pcrread sha256:0 >/tmp/tpm-pcr 2>/tmp/tpm-pcr.err; then
+            pass TPM2
+        else
+            fail TPM2 'random/PCR operation'
+        fi
+    else
+        fail TPM2 'device absent'
+        find /sys/class/tpm -maxdepth 2 -print 2>/dev/null || true
+        ls -l /dev/tpm* 2>/dev/null || true
+    fi
 
     if [ -d /sys/bus/usb/devices ] && find /sys/bus/usb/devices -mindepth 1 -maxdepth 1 | grep -q .; then pass XHCI-USB; else fail XHCI-USB; fi
 
