@@ -14,14 +14,10 @@ from z3 import (
     Bool,
     Extract,
     If,
-    Implies,
     Int,
-    LShR,
     Not,
     Or,
     Solver,
-    UGE,
-    ULT,
     ZeroExt,
     unsat,
 )
@@ -178,14 +174,24 @@ def main() -> None:
         And(advanced >= 0, advanced < depth),
     )
 
-    key = BitVec("key", 4)
-    shift = ZeroExt(60, key) << 1
-    pkru_mask = BitVecVal(3, 64) << shift
-    prove(
-        "MPK mask contains exactly two adjacent access-disable bits",
-        None,
-        LShR(pkru_mask, shift) & BitVecVal(3, 64) == BitVecVal(3, 64),
-    )
+    # MPK has exactly 16 architectural keys. Constant shifts avoid an
+    # unnecessarily expensive symbolic variable-shift search while still
+    # proving every legal key exhaustively.
+    for key in range(16):
+        mask = BitVecVal(3 << (key * 2), 64)
+        expected = BitVecVal(3, 64)
+        prove(
+            f"MPK key {key} sets exactly its two PKRU bits",
+            None,
+            ((mask >> (key * 2)) & BitVecVal(3, 64)) == expected,
+        )
+        if key:
+            lower = (1 << (key * 2)) - 1
+            prove(
+                f"MPK key {key} leaves lower keys unchanged",
+                None,
+                (mask & BitVecVal(lower, 64)) == BitVecVal(0, 64),
+            )
 
     bdf = BitVec("bdf", 16)
     allow0 = BitVec("allow0", 16)
