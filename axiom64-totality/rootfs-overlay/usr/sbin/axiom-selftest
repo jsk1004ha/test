@@ -7,7 +7,6 @@ FAILURES=0
 
 pass() { echo "$1: PASS"; }
 fail() { echo "$1: FAIL${2:+ — $2}"; FAILURES=$((FAILURES+1)); }
-check_cmd() { command -v "$1" >/dev/null 2>&1 && pass "COMMAND-$1" || fail "COMMAND-$1"; }
 
 settle_devices() {
     mdev -s 2>/dev/null || true
@@ -19,10 +18,7 @@ wait_block_label() {
     i=0
     while [ "$i" -lt 300 ]; do
         dev=$(blkid -L "$label" 2>/dev/null || true)
-        if [ -n "$dev" ] && [ -b "$dev" ]; then
-            echo "$dev"
-            return 0
-        fi
+        if [ -n "$dev" ] && [ -b "$dev" ]; then echo "$dev"; return 0; fi
         if [ $((i % 10)) -eq 0 ]; then settle_devices; fi
         sleep 0.1
         i=$((i+1))
@@ -43,6 +39,64 @@ wait_char_any() {
     return 1
 }
 
+kernel_config_test() {
+    cfg=/etc/axiom/kernel.config
+    if [ ! -s "$cfg" ]; then fail KERNEL-HARDENING-CONFIG 'config absent'; return; fi
+    missing=''
+    for opt in \
+      CONFIG_RANDOMIZE_BASE CONFIG_PAGE_TABLE_ISOLATION CONFIG_SECCOMP \
+      CONFIG_SECURITY_LANDLOCK CONFIG_BPF_SYSCALL CONFIG_IO_URING \
+      CONFIG_INTEL_IOMMU CONFIG_TCG_TPM CONFIG_DM_VERITY \
+      CONFIG_BTRFS_FS CONFIG_XFS_FS CONFIG_CGROUPS CONFIG_NAMESPACES; do
+        grep -Eq "^${opt}=(y|m)$" "$cfg" || missing="$missing $opt"
+    done
+    [ -z "$missing" ] && pass KERNEL-HARDENING-CONFIG || fail KERNEL-HARDENING-CONFIG "missing:$missing"
+}
+
+tpm_test() {
+    prefix=${1:-TPM2}
+    dev=$(wait_char_any /dev/tpmrm0 /dev/tpm0 || true)
+    if [ -z "$dev" ]; then
+        fail "$prefix" 'device absent'
+        find /sys/class/tpm -maxdepth 3 -print 2>/dev/null || true
+        ls -l /dev/tpm* 2>/dev/null || true
+        return
+    fi
+    tcti="device:$dev"
+    rm -rf /tmp/axiom-tpm
+    mkdir -p /tmp/axiom-tpm
+    tpm2_startup -T "$tcti" -c >/tmp/axiom-tpm/startup.out 2>/tmp/axiom-tpm/startup.err || true
+    if ! tpm2_getrandom -T "$tcti" -o /tmp/axiom-tpm/random.bin 32 \
+         >/tmp/axiom-tpm/random.out 2>/tmp/axiom-tpm/random.err; then
+        cat /tmp/axiom-tpm/random.err 2>/dev/null || true
+        fail "$prefix" 'getrandom'
+        return
+    fi
+    if [ "$(wc -c </tmp/axiom-tpm/random.bin)" -ne 32 ]; then fail "$prefix" 'random length'; return; fi
+    if ! tpm2_pcrread -T "$tcti" sha256:0,7,16 >/tmp/axiom-tpm/pcr.out 2>/tmp/axiom-tpm/pcr.err; then
+        cat /tmp/axiom-tpm/pcr.err 2>/dev/null || true
+        fail "$prefix" 'PCR read'
+        return
+    fi
+    printf '%s' 'Axiom64-TPM-sealed-secret' > /tmp/axiom-tpm/secret.in
+    if ! tpm2_createprimary -T "$tcti" -Q -C o -g sha256 -G rsa \
+         -c /tmp/axiom-tpm/primary.ctx >/tmp/axiom-tpm/createprimary.out 2>/tmp/axiom-tpm/createprimary.err || \
+       ! tpm2_create -T "$tcti" -Q -C /tmp/axiom-tpm/primary.ctx -g sha256 -G keyedhash \
+         -i /tmp/axiom-tpm/secret.in -u /tmp/axiom-tpm/seal.pub -r /tmp/axiom-tpm/seal.priv \
+         >/tmp/axiom-tpm/create.out 2>/tmp/axiom-tpm/create.err || \
+       ! tpm2_load -T "$tcti" -Q -C /tmp/axiom-tpm/primary.ctx \
+         -u /tmp/axiom-tpm/seal.pub -r /tmp/axiom-tpm/seal.priv -c /tmp/axiom-tpm/seal.ctx \
+         >/tmp/axiom-tpm/load.out 2>/tmp/axiom-tpm/load.err || \
+       ! tpm2_unseal -T "$tcti" -Q -c /tmp/axiom-tpm/seal.ctx -o /tmp/axiom-tpm/secret.out \
+         >/tmp/axiom-tpm/unseal.out 2>/tmp/axiom-tpm/unseal.err || \
+       ! cmp -s /tmp/axiom-tpm/secret.in /tmp/axiom-tpm/secret.out; then
+        cat /tmp/axiom-tpm/*.err 2>/dev/null || true
+        fail "$prefix" 'seal/unseal'
+        return
+    fi
+    pass "$prefix"
+}
+
 CPUS=$(nproc 2>/dev/null || echo 1)
 echo "CPU-COUNT: $CPUS"
 [ "$CPUS" -eq "$EXPECTED" ] && pass SMP || fail SMP "expected=$EXPECTED actual=$CPUS"
@@ -51,65 +105,87 @@ echo "CPU-COUNT: $CPUS"
 mountpoint -q /sys/fs/cgroup && grep -q cgroup2 /proc/mounts && pass CGROUP-V2 || fail CGROUP-V2
 unshare -m /bin/true >/dev/null 2>&1 && pass MOUNT-NAMESPACE || fail MOUNT-NAMESPACE
 /usr/bin/axiom-security-probe || FAILURES=$((FAILURES+1))
-/usr/bin/axiom-asm-probe >/tmp/asm.out 2>&1 && grep -q 'AXIOM-ASSEMBLY-PLANE: PASS' /tmp/asm.out && pass ASSEMBLY-PLANE || fail ASSEMBLY-PLANE
+/usr/bin/axiom-asm-probe >/tmp/asm.out 2>&1 && \
+  grep -q 'AXIOM-ASSEMBLY-PLANE: PASS' /tmp/asm.out && pass ASSEMBLY-PLANE || fail ASSEMBLY-PLANE
+kernel_config_test
+
+if [ "$MODE" != secureboot ]; then
+    /usr/bin/axiom-advanced-probe || FAILURES=$((FAILURES+1))
+fi
 
 rm -rf /tmp/ovl-lower /tmp/ovl-upper /tmp/ovl-work /tmp/ovl-merged
 mkdir -p /tmp/ovl-lower /tmp/ovl-upper /tmp/ovl-work /tmp/ovl-merged
 echo immutable > /tmp/ovl-lower/seed
 if mount -t overlay overlay -o lowerdir=/tmp/ovl-lower,upperdir=/tmp/ovl-upper,workdir=/tmp/ovl-work /tmp/ovl-merged 2>/dev/null; then
-    echo mutable > /tmp/ovl-merged/new && grep -q mutable /tmp/ovl-upper/new && pass OVERLAYFS || fail OVERLAYFS
+    echo mutable > /tmp/ovl-merged/new
+    grep -q mutable /tmp/ovl-upper/new && pass OVERLAYFS || fail OVERLAYFS 'copy-up'
     umount /tmp/ovl-merged
-else fail OVERLAYFS; fi
+else fail OVERLAYFS 'mount'; fi
 
 if [ -d /sys/firmware/efi ]; then echo 'BOOT-FIRMWARE: UEFI'; else echo 'BOOT-FIRMWARE: BIOS'; fi
 
+if [ "$MODE" = secureboot ]; then
+    if [ ! -d /sys/firmware/efi ]; then
+        fail UEFI-SECURE-BOOT 'not booted through UEFI'
+    else
+        sb=''
+        for f in /sys/firmware/efi/efivars/SecureBoot-*; do
+            [ -f "$f" ] || continue
+            sb=$(od -An -t u1 -j4 -N1 "$f" 2>/dev/null | tr -d ' ')
+            break
+        done
+        [ "$sb" = 1 ] && pass UEFI-SECURE-BOOT || fail UEFI-SECURE-BOOT "variable=$sb"
+    fi
+    if [ -r /sys/kernel/security/lockdown ]; then
+        grep -Eq '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown && \
+          pass KERNEL-LOCKDOWN || fail KERNEL-LOCKDOWN "$(cat /sys/kernel/security/lockdown)"
+    else
+        fail KERNEL-LOCKDOWN 'securityfs lockdown state absent'
+    fi
+    tpm_test TPM2-MEASURED-BOOT
+fi
+
 if [ "$MODE" = full ]; then
-    [ -d /sys/devices/system/node/node1 ] && pass NUMA || fail NUMA
+    [ -d /sys/devices/system/node/node1 ] && pass NUMA || fail NUMA 'node1 absent'
+    if numactl --hardware >/tmp/numa.out 2>&1 && grep -Eq 'available: 2 nodes|available: [3-9][0-9]* nodes' /tmp/numa.out && \
+       numactl --cpunodebind=1 --membind=1 sh -c "grep -q '^Mems_allowed_list:[[:space:]]*1' /proc/self/status"; then
+        pass NUMA-AFFINITY
+    else
+        cat /tmp/numa.out 2>/dev/null || true
+        fail NUMA-AFFINITY 'binding failed'
+    fi
     if [ -d /sys/kernel/iommu_groups ] && find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 | grep -q .; then pass IOMMU; else fail IOMMU; fi
 
     VIRTIO_DEV=$(wait_block_label AXIOM_VIRTIO || true)
     NVME_DEV=$(wait_block_label AXIOM_NVME || true)
     AHCI_DEV=$(wait_block_label AXIOM_AHCI || true)
+    USB_DEV=$(wait_block_label AXIOM_USB || true)
 
     [ -n "$VIRTIO_DEV" ] || fail VIRTIO-BLK 'device absent'
     [ -n "$NVME_DEV" ] || fail NVME 'device absent'
     [ -n "$AHCI_DEV" ] || fail AHCI 'device absent'
+    [ -n "$USB_DEV" ] || fail USB-MASS-STORAGE 'device absent'
 
     test_disk() {
-        dev=$1
-        label=$2
-        marker=$3
+        dev=$1; label=$2; marker=$3
         mp=/mnt/$label
         mkdir -p "$mp"
         actual=$(blkid -s LABEL -o value "$dev" 2>/dev/null || true)
         if [ "$actual" != "$label" ]; then fail "$marker" "label=$actual"; return; fi
         if mount -t ext4 -o rw "$dev" "$mp" 2>/dev/null; then
-            token="Axiom64-$label-$(cat /proc/uptime | cut -d. -f1)"
+            token="Axiom64-PERSIST-$label"
             printf '%s\n' "$token" > "$mp/qualification.txt"
             sync
-            if grep -qx "$token" "$mp/qualification.txt"; then pass "$marker"; else fail "$marker" 'readback'; fi
+            grep -qx "$token" "$mp/qualification.txt" && pass "$marker" || fail "$marker" 'readback'
             umount "$mp"
         else fail "$marker" 'mount'; fi
     }
     [ -n "$VIRTIO_DEV" ] && test_disk "$VIRTIO_DEV" AXIOM_VIRTIO VIRTIO-BLK
     [ -n "$NVME_DEV" ] && test_disk "$NVME_DEV" AXIOM_NVME NVME
     [ -n "$AHCI_DEV" ] && test_disk "$AHCI_DEV" AXIOM_AHCI AHCI
+    [ -n "$USB_DEV" ] && test_disk "$USB_DEV" AXIOM_USB USB-MASS-STORAGE
 
-    TPM_DEV=$(wait_char_any /dev/tpmrm0 /dev/tpm0 || true)
-    if [ -n "$TPM_DEV" ]; then
-        tpm2_startup -c >/tmp/tpm-startup.out 2>/tmp/tpm-startup.err || true
-        if tpm2_getrandom 32 >/tmp/tpm.random 2>/tmp/tpm.err && \
-           [ "$(wc -c </tmp/tpm.random)" -ge 32 ] && \
-           tpm2_pcrread sha256:0 >/tmp/tpm-pcr 2>/tmp/tpm-pcr.err; then
-            pass TPM2
-        else
-            fail TPM2 'random/PCR operation'
-        fi
-    else
-        fail TPM2 'device absent'
-        find /sys/class/tpm -maxdepth 2 -print 2>/dev/null || true
-        ls -l /dev/tpm* 2>/dev/null || true
-    fi
+    tpm_test TPM2
 
     if [ -d /sys/bus/usb/devices ] && find /sys/bus/usb/devices -mindepth 1 -maxdepth 1 | grep -q .; then pass XHCI-USB; else fail XHCI-USB; fi
 
@@ -121,40 +197,245 @@ if [ "$MODE" = full ]; then
     grep -q '^ *0 ' /proc/asound/cards 2>/dev/null && pass AUDIO || fail AUDIO
 
     if nft add table inet axiom_test 2>/dev/null; then
-        nft 'add chain inet axiom_test input { type filter hook input priority 0; policy accept; }' 2>/dev/null && pass NFTABLES || fail NFTABLES
+        nft 'add chain inet axiom_test input { type filter hook input priority 0; policy accept; }' 2>/dev/null && \
+          nft add rule inet axiom_test input iif lo accept 2>/dev/null && pass NFTABLES || fail NFTABLES
         nft delete table inet axiom_test 2>/dev/null || true
     else fail NFTABLES; fi
 
-    if ip link add wgtest type wireguard 2>/dev/null; then ip link del wgtest; pass WIREGUARD; else fail WIREGUARD; fi
+    rm -rf /run/netns/wg-a /run/netns/wg-b 2>/dev/null || true
+    ip netns del wg-a 2>/dev/null || true
+    ip netns del wg-b 2>/dev/null || true
+    if ip netns add wg-a && ip netns add wg-b && \
+       ip link add wg-veth-a type veth peer name wg-veth-b && \
+       ip link set wg-veth-a netns wg-a && ip link set wg-veth-b netns wg-b; then
+        ip -n wg-a link set lo up
+        ip -n wg-b link set lo up
+        ip -n wg-a addr add 192.0.2.1/30 dev wg-veth-a
+        ip -n wg-b addr add 192.0.2.2/30 dev wg-veth-b
+        ip -n wg-a link set wg-veth-a up
+        ip -n wg-b link set wg-veth-b up
+        wg genkey > /tmp/wg-a.key
+        wg genkey > /tmp/wg-b.key
+        wg pubkey < /tmp/wg-a.key > /tmp/wg-a.pub
+        wg pubkey < /tmp/wg-b.key > /tmp/wg-b.pub
+        ip -n wg-a link add wg0 type wireguard
+        ip -n wg-b link add wg0 type wireguard
+        ip netns exec wg-a wg set wg0 listen-port 51820 private-key /tmp/wg-a.key \
+          peer "$(cat /tmp/wg-b.pub)" allowed-ips 10.90.0.2/32 endpoint 192.0.2.2:51821
+        ip netns exec wg-b wg set wg0 listen-port 51821 private-key /tmp/wg-b.key \
+          peer "$(cat /tmp/wg-a.pub)" allowed-ips 10.90.0.1/32 endpoint 192.0.2.1:51820
+        ip -n wg-a addr add 10.90.0.1/24 dev wg0
+        ip -n wg-b addr add 10.90.0.2/24 dev wg0
+        ip -n wg-a link set wg0 up
+        ip -n wg-b link set wg0 up
+        if ip netns exec wg-a ping -c 2 -W 3 10.90.0.2 >/tmp/wg-ping 2>&1 && \
+           ip netns exec wg-a wg show wg0 latest-handshakes | grep -Eq '[1-9][0-9]*$'; then
+            pass WIREGUARD-TUNNEL
+        else cat /tmp/wg-ping 2>/dev/null || true; fail WIREGUARD-TUNNEL 'encrypted ping'; fi
+    else fail WIREGUARD-TUNNEL 'namespace setup'; fi
+    ip netns del wg-a 2>/dev/null || true
+    ip netns del wg-b 2>/dev/null || true
+    rm -f /tmp/wg-a.key /tmp/wg-b.key /tmp/wg-a.pub /tmp/wg-b.pub
 
-    dd if=/dev/zero of=/tmp/btrfs.img bs=1M count=128 status=none
+    dd if=/dev/zero of=/tmp/btrfs.img bs=1M count=0 seek=192 status=none
     loopb=$(losetup -f --show /tmp/btrfs.img 2>/dev/null || true)
     if [ -n "$loopb" ] && mkfs.btrfs -q -f "$loopb" >/dev/null 2>&1; then
         mkdir -p /mnt/btrfs
-        if mount -t btrfs "$loopb" /mnt/btrfs 2>/dev/null; then echo btrfs-ok >/mnt/btrfs/probe; sync; grep -q btrfs-ok /mnt/btrfs/probe && pass BTRFS || fail BTRFS; umount /mnt/btrfs; else fail BTRFS; fi
+        if mount -t btrfs "$loopb" /mnt/btrfs 2>/dev/null && \
+           btrfs subvolume create /mnt/btrfs/live >/dev/null && \
+           printf original > /mnt/btrfs/live/value && sync && \
+           btrfs subvolume snapshot -r /mnt/btrfs/live /mnt/btrfs/snapshot >/dev/null; then
+            printf changed > /mnt/btrfs/live/value
+            if grep -qx original /mnt/btrfs/snapshot/value && grep -qx changed /mnt/btrfs/live/value; then pass BTRFS-SNAPSHOT; else fail BTRFS-SNAPSHOT 'snapshot content'; fi
+            umount /mnt/btrfs
+        else fail BTRFS-SNAPSHOT 'mount/subvolume'; umount /mnt/btrfs 2>/dev/null || true; fi
         losetup -d "$loopb"
-    else fail BTRFS; [ -n "$loopb" ] && losetup -d "$loopb" 2>/dev/null || true; fi
+    else fail BTRFS-SNAPSHOT 'format'; [ -n "$loopb" ] && losetup -d "$loopb" 2>/dev/null || true; fi
 
-    dd if=/dev/zero of=/tmp/crypt.img bs=1M count=64 status=none
+    dd if=/dev/zero of=/tmp/xfs.img bs=1M count=0 seek=512 status=none
+    loopx=$(losetup -f --show /tmp/xfs.img 2>/dev/null || true)
+    if [ -n "$loopx" ] && mkfs.xfs -q -f "$loopx" >/dev/null 2>&1; then
+        mkdir -p /mnt/xfs
+        if mount -t xfs "$loopx" /mnt/xfs 2>/dev/null; then
+            printf xfs-journaled > /mnt/xfs/value; sync
+            grep -qx xfs-journaled /mnt/xfs/value && pass XFS || fail XFS 'readback'
+            umount /mnt/xfs
+        else fail XFS 'mount'; fi
+        losetup -d "$loopx"
+    else fail XFS 'format'; [ -n "$loopx" ] && losetup -d "$loopx" 2>/dev/null || true; fi
+
+    mkdir -p /tmp/squash-src /mnt/squash
+    printf immutable-squash > /tmp/squash-src/value
+    if mksquashfs /tmp/squash-src /tmp/axiom.sqfs -noappend -quiet >/dev/null 2>&1 && \
+       mount -t squashfs -o loop,ro /tmp/axiom.sqfs /mnt/squash 2>/dev/null; then
+        if grep -qx immutable-squash /mnt/squash/value && ! sh -c 'echo x >/mnt/squash/new' 2>/dev/null; then pass SQUASHFS-IMMUTABLE; else fail SQUASHFS-IMMUTABLE; fi
+        umount /mnt/squash
+    else fail SQUASHFS-IMMUTABLE 'build/mount'; fi
+
+    dd if=/dev/zero of=/tmp/raid-a.img bs=1M count=0 seek=128 status=none
+    dd if=/dev/zero of=/tmp/raid-b.img bs=1M count=0 seek=128 status=none
+    ra=$(losetup -f --show /tmp/raid-a.img 2>/dev/null || true)
+    rb=$(losetup -f --show /tmp/raid-b.img 2>/dev/null || true)
+    if [ -n "$ra" ] && [ -n "$rb" ] && \
+       mdadm --create /dev/md0 --run --force --metadata=1.2 --level=1 --raid-devices=2 "$ra" "$rb" >/tmp/mdadm.out 2>&1; then
+        mdev -s; mkfs.ext4 -q -F /dev/md0
+        mkdir -p /mnt/raid
+        if mount /dev/md0 /mnt/raid; then
+            printf mirrored > /mnt/raid/value; sync
+            grep -qx mirrored /mnt/raid/value && grep -q '^md0 : active raid1' /proc/mdstat && pass MD-RAID1 || fail MD-RAID1
+            umount /mnt/raid
+        else fail MD-RAID1 'mount'; fi
+        mdadm --stop /dev/md0 >/dev/null 2>&1 || true
+    else cat /tmp/mdadm.out 2>/dev/null || true; fail MD-RAID1 'create'; fi
+    [ -n "$ra" ] && losetup -d "$ra" 2>/dev/null || true
+    [ -n "$rb" ] && losetup -d "$rb" 2>/dev/null || true
+
+    dd if=/dev/zero of=/tmp/lvm.img bs=1M count=0 seek=384 status=none
+    loopl=$(losetup -f --show /tmp/lvm.img 2>/dev/null || true)
+    mkdir -p /run/lock/lvm /mnt/lvm-origin /mnt/lvm-snapshot
+    if [ -n "$loopl" ] && pvcreate -ff -y "$loopl" >/dev/null 2>&1 && \
+       vgcreate axvg "$loopl" >/dev/null 2>&1 && \
+       lvcreate -L 128M -n data axvg >/dev/null 2>&1; then
+        mkfs.ext4 -q -F /dev/axvg/data
+        if mount /dev/axvg/data /mnt/lvm-origin; then
+            printf before-snapshot > /mnt/lvm-origin/value; sync; umount /mnt/lvm-origin
+            if lvcreate -s -L 64M -n snap /dev/axvg/data >/dev/null 2>&1 && \
+               mount /dev/axvg/data /mnt/lvm-origin && \
+               mount -o ro /dev/axvg/snap /mnt/lvm-snapshot; then
+                printf after-snapshot > /mnt/lvm-origin/value; sync
+                if grep -qx before-snapshot /mnt/lvm-snapshot/value && grep -qx after-snapshot /mnt/lvm-origin/value; then pass LVM-SNAPSHOT; else fail LVM-SNAPSHOT 'content'; fi
+                umount /mnt/lvm-snapshot; umount /mnt/lvm-origin
+            else fail LVM-SNAPSHOT 'snapshot mount'; umount /mnt/lvm-origin 2>/dev/null || true; fi
+        else fail LVM-SNAPSHOT 'origin mount'; fi
+        lvremove -ff -y axvg >/dev/null 2>&1 || true
+        vgremove -ff -y axvg >/dev/null 2>&1 || true
+        pvremove -ff -y "$loopl" >/dev/null 2>&1 || true
+    else fail LVM-SNAPSHOT 'create'; fi
+    [ -n "$loopl" ] && losetup -d "$loopl" 2>/dev/null || true
+
+    dd if=/dev/zero of=/tmp/crypt.img bs=1M count=0 seek=128 status=none
     loopc=$(losetup -f --show /tmp/crypt.img 2>/dev/null || true)
     openssl dgst -sha256 -binary /etc/axiom/release > /tmp/axiom-crypt.key
-    if [ -n "$loopc" ] && cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 256 --key-file /tmp/axiom-crypt.key "$loopc" axiomcrypt >/dev/null 2>&1; then
+    if [ -n "$loopc" ] && \
+       cryptsetup luksFormat --type luks2 --batch-mode --key-file /tmp/axiom-crypt.key "$loopc" >/dev/null 2>&1 && \
+       cryptsetup open --key-file /tmp/axiom-crypt.key "$loopc" axiomcrypt >/dev/null 2>&1; then
         mkfs.ext4 -q -F /dev/mapper/axiomcrypt
         mkdir -p /mnt/crypt
-        if mount /dev/mapper/axiomcrypt /mnt/crypt; then echo encrypted >/mnt/crypt/probe; sync; grep -q encrypted /mnt/crypt/probe && pass DM-CRYPT || fail DM-CRYPT; umount /mnt/crypt; else fail DM-CRYPT; fi
+        if mount /dev/mapper/axiomcrypt /mnt/crypt; then
+            printf encrypted > /mnt/crypt/probe; sync
+            grep -qx encrypted /mnt/crypt/probe && pass LUKS2-DM-CRYPT || fail LUKS2-DM-CRYPT
+            umount /mnt/crypt
+        else fail LUKS2-DM-CRYPT 'mount'; fi
         cryptsetup close axiomcrypt
-        losetup -d "$loopc"
-    else fail DM-CRYPT; [ -n "$loopc" ] && losetup -d "$loopc" 2>/dev/null || true; fi
+    else fail LUKS2-DM-CRYPT 'format/open'; fi
+    [ -n "$loopc" ] && losetup -d "$loopc" 2>/dev/null || true
     rm -f /tmp/axiom-crypt.key
 
-    dropbear -R -E -p 2222 >/run/dropbear-test.log 2>&1 &
-    dbpid=$!
-    sleep 1
-    ss -ltn | grep -q ':2222 ' && pass SSH-SERVER || fail SSH-SERVER
-    kill "$dbpid" 2>/dev/null || true
+    dd if=/dev/zero of=/tmp/verity-data.img bs=1M count=0 seek=96 status=none
+    dd if=/dev/zero of=/tmp/verity-hash.img bs=1M count=0 seek=32 status=none
+    vd=$(losetup -f --show /tmp/verity-data.img 2>/dev/null || true)
+    vh=$(losetup -f --show /tmp/verity-hash.img 2>/dev/null || true)
+    mkdir -p /mnt/verity-src /mnt/verity
+    if [ -n "$vd" ] && [ -n "$vh" ]; then
+        mkfs.ext4 -q -F "$vd"
+        if mount "$vd" /mnt/verity-src; then
+            printf verified > /mnt/verity-src/value; sync; umount /mnt/verity-src
+            root_hash=$(veritysetup format "$vd" "$vh" 2>/tmp/verity-format.err | awk '/Root hash:/ {print $3}')
+            if [ -n "$root_hash" ] && veritysetup open "$vd" axiomverity "$vh" "$root_hash" >/dev/null 2>&1 && \
+               mount -o ro /dev/mapper/axiomverity /mnt/verity; then
+                grep -qx verified /mnt/verity/value && pass DM-VERITY || fail DM-VERITY 'readback'
+                umount /mnt/verity; veritysetup close axiomverity
+                printf '\001' | dd of="$vd" bs=1 seek=$((2*1024*1024)) conv=notrunc status=none
+                if veritysetup verify "$vd" "$vh" "$root_hash" >/tmp/verity-tamper.out 2>&1; then
+                    fail DM-VERITY-TAMPER-REJECT 'corruption accepted'
+                else pass DM-VERITY-TAMPER-REJECT; fi
+            else cat /tmp/verity-format.err 2>/dev/null || true; fail DM-VERITY 'format/open'; fi
+        else fail DM-VERITY 'source mount'; fi
+    else fail DM-VERITY 'loop allocation'; fi
+    [ -n "$vd" ] && losetup -d "$vd" 2>/dev/null || true
+    [ -n "$vh" ] && losetup -d "$vh" 2>/dev/null || true
 
-    if openssl dgst -sha256 /etc/axiom/release >/tmp/tls-digest 2>/dev/null && [ -s /tmp/tls-digest ]; then pass TLS-CRYPTO; else fail TLS-CRYPTO; fi
-    weston --version >/dev/null 2>&1 && pass WAYLAND-COMPOSITOR || fail WAYLAND-COMPOSITOR
+    OCI=/tmp/axiom-oci
+    rm -rf "$OCI"; mkdir -p "$OCI/rootfs/proc"
+    cp /usr/bin/axiom-container-probe "$OCI/rootfs/probe"
+    chmod 0755 "$OCI/rootfs/probe"
+    cat > "$OCI/config.json" <<'JSON'
+{
+  "ociVersion":"1.0.2",
+  "process":{
+    "terminal":false,
+    "user":{"uid":0,"gid":0},
+    "args":["/probe"],
+    "env":["PATH=/"],
+    "cwd":"/",
+    "noNewPrivileges":true,
+    "capabilities":{"bounding":[],"effective":[],"inheritable":[],"permitted":[],"ambient":[]}
+  },
+  "root":{"path":"rootfs","readonly":true},
+  "hostname":"axiom-sandbox",
+  "mounts":[{"destination":"/proc","type":"proc","source":"proc","options":["nosuid","noexec","nodev"]}],
+  "linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"uts"},{"type":"ipc"},{"type":"cgroup"}]}
+}
+JSON
+    rm -rf /run/crun/axiom-oci 2>/dev/null || true
+    if crun --root /run/crun run --bundle "$OCI" axiom-oci >/tmp/oci.out 2>/tmp/oci.err && \
+       grep -q 'OCI-CONTAINER: PASS' /tmp/oci.out; then pass OCI-CONTAINER; else cat /tmp/oci.err /tmp/oci.out 2>/dev/null || true; fail OCI-CONTAINER; fi
+
+    mkdir -p /sys/fs/cgroup/axiom-test
+    available=$(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || true)
+    for ctl in cpu memory pids; do
+        echo "$available" | grep -qw "$ctl" && echo "+$ctl" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+    done
+    sleep 30 & cgpid=$!
+    if echo 16 > /sys/fs/cgroup/axiom-test/pids.max 2>/dev/null && \
+       echo "$cgpid" > /sys/fs/cgroup/axiom-test/cgroup.procs 2>/dev/null && \
+       grep -qx 16 /sys/fs/cgroup/axiom-test/pids.max; then pass CGROUP-V2-CONTROL; else fail CGROUP-V2-CONTROL; fi
+    kill "$cgpid" 2>/dev/null || true
+    wait "$cgpid" 2>/dev/null || true
+    rmdir /sys/fs/cgroup/axiom-test 2>/dev/null || true
+
+    printf xattr-value > /tmp/metadata-file
+    if setfattr -n user.axiom -v advanced /tmp/metadata-file && \
+       getfattr -n user.axiom --only-values /tmp/metadata-file 2>/dev/null | grep -qx advanced && \
+       setfacl -m u:65534:r /tmp/metadata-file && getfacl /tmp/metadata-file 2>/dev/null | grep -q 'user:65534:r--'; then
+        pass ACL-XATTR
+    else fail ACL-XATTR; fi
+
+    keyid=$(keyctl add user axiom-totality secret @s 2>/dev/null || true)
+    if [ -n "$keyid" ] && keyctl pipe "$keyid" 2>/dev/null | grep -qx secret; then pass KERNEL-KEYRING; else fail KERNEL-KEYRING; fi
+    [ -n "$keyid" ] && keyctl revoke "$keyid" 2>/dev/null || true
+
+    mkdir -p /tmp/tls
+    if openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+       -subj /CN=axiom.local -keyout /tmp/tls/key.pem -out /tmp/tls/cert.pem >/dev/null 2>&1; then
+        openssl s_server -quiet -www -accept 127.0.0.1:8443 -cert /tmp/tls/cert.pem -key /tmp/tls/key.pem >/tmp/tls/server.out 2>/tmp/tls/server.err &
+        tlspid=$!; sleep 1
+        if printf 'GET / HTTP/1.0\r\nHost: axiom.local\r\n\r\n' | \
+           openssl s_client -quiet -connect 127.0.0.1:8443 -servername axiom.local \
+             -CAfile /tmp/tls/cert.pem >/tmp/tls/client.out 2>/tmp/tls/client.err && \
+           grep -q '200 ok' /tmp/tls/client.out; then pass TLS-HANDSHAKE; else cat /tmp/tls/client.err 2>/dev/null || true; fail TLS-HANDSHAKE; fi
+        kill "$tlspid" 2>/dev/null || true; wait "$tlspid" 2>/dev/null || true
+    else fail TLS-HANDSHAKE 'certificate generation'; fi
+
+    mkdir -p /tmp/http; printf totality-http > /tmp/http/index.html
+    httpd -f -p 127.0.0.1:8080 -h /tmp/http >/tmp/httpd.log 2>&1 &
+    httppid=$!; sleep 1
+    wget -qO- http://127.0.0.1:8080/ 2>/dev/null | grep -qx totality-http && pass HTTP-STACK || fail HTTP-STACK
+    kill "$httppid" 2>/dev/null || true; wait "$httppid" 2>/dev/null || true
+
+    export XDG_RUNTIME_DIR=/run/weston-test
+    rm -rf "$XDG_RUNTIME_DIR"; mkdir -p "$XDG_RUNTIME_DIR"; chmod 0700 "$XDG_RUNTIME_DIR"
+    weston --backend=headless-backend.so --socket=wayland-axiom --idle-time=0 --no-config --log=/tmp/weston.log >/dev/null 2>&1 &
+    westonpid=$!
+    i=0; while [ "$i" -lt 50 ] && [ ! -S "$XDG_RUNTIME_DIR/wayland-axiom" ]; do sleep 0.1; i=$((i+1)); done
+    if [ -S "$XDG_RUNTIME_DIR/wayland-axiom" ] && kill -0 "$westonpid" 2>/dev/null; then pass WAYLAND-COMPOSITOR; else cat /tmp/weston.log 2>/dev/null || true; fail WAYLAND-COMPOSITOR; fi
+    kill "$westonpid" 2>/dev/null || true; wait "$westonpid" 2>/dev/null || true
+
+    dropbear -R -E -p 2222 >/run/dropbear-test.log 2>&1 &
+    dbpid=$!; sleep 1
+    ss -ltn | grep -q ':2222 ' && pass SSH-SERVER || fail SSH-SERVER
+    kill "$dbpid" 2>/dev/null || true; wait "$dbpid" 2>/dev/null || true
+
     apk --version >/dev/null 2>&1 && pass PACKAGE-MANAGER || fail PACKAGE-MANAGER
     ldd /bin/busybox >/dev/null 2>&1 && pass DYNAMIC-ELF || fail DYNAMIC-ELF
 fi
