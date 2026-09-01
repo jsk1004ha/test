@@ -24,7 +24,8 @@ PASS_COUNT=0
 
 record_pass() { echo "PASS: $*" | tee -a "$REPORT"; PASS_COUNT=$((PASS_COUNT+1)); }
 require_marker() {
-  local log="$1" marker="$2"
+  local log="$1"
+  local marker="$2"
   if ! grep -Fq "$marker" "$log"; then
     echo "Missing marker: $marker" >&2
     tail -n 250 "$log" >&2 || true
@@ -33,7 +34,8 @@ require_marker() {
 }
 
 run_core() {
-  local cpus="$1" log="$LOGS/core-smp${cpus}.log"
+  local cpus="$1"
+  local log="$LOGS/core-smp${cpus}.log"
   timeout 300 "$QEMU_BIN" \
     -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp "$cpus" -m 1536 \
     -kernel "$KERNEL" -initrd "$INITRD" \
@@ -47,7 +49,9 @@ run_core() {
 for n in 1 2 4 8; do run_core "$n"; done
 
 make_disk() {
-  local file="$1" label="$2" size="${3:-128M}"
+  local file="$1"
+  local label="$2"
+  local size="${3:-128M}"
   truncate -s "$size" "$file"
   mkfs.ext4 -q -F -L "$label" "$file"
 }

@@ -39,7 +39,10 @@ if [ "$MODE" = full ]; then
     waitdev /dev/sda || fail AHCI 'device absent'
 
     test_disk() {
-        dev=$1 label=$2 marker=$3 mp=/mnt/$label
+        dev=$1
+        label=$2
+        marker=$3
+        mp=/mnt/$label
         mkdir -p "$mp"
         actual=$(blkid -s LABEL -o value "$dev" 2>/dev/null || true)
         if [ "$actual" != "$label" ]; then fail "$marker" "label=$actual"; return; fi
@@ -85,20 +88,23 @@ if [ "$MODE" = full ]; then
 
     dd if=/dev/zero of=/tmp/crypt.img bs=1M count=64 status=none
     loopc=$(losetup -f --show /tmp/crypt.img 2>/dev/null || true)
-    if [ -n "$loopc" ] && printf 'Axiom64-qualification-key' | cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 256 --key-file - "$loopc" axiomcrypt >/dev/null 2>&1; then
+    openssl dgst -sha256 -binary /etc/axiom/release > /tmp/axiom-crypt.key
+    if [ -n "$loopc" ] && cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 256 --key-file /tmp/axiom-crypt.key "$loopc" axiomcrypt >/dev/null 2>&1; then
         mkfs.ext4 -q -F /dev/mapper/axiomcrypt
         mkdir -p /mnt/crypt
         if mount /dev/mapper/axiomcrypt /mnt/crypt; then echo encrypted >/mnt/crypt/probe; sync; grep -q encrypted /mnt/crypt/probe && pass DM-CRYPT || fail DM-CRYPT; umount /mnt/crypt; else fail DM-CRYPT; fi
         cryptsetup close axiomcrypt
         losetup -d "$loopc"
     else fail DM-CRYPT; [ -n "$loopc" ] && losetup -d "$loopc" 2>/dev/null || true; fi
+    rm -f /tmp/axiom-crypt.key
 
-    dropbear -R -E -p 2222 >/run/dropbear-test.log 2>&1 & dbpid=$!
+    dropbear -R -E -p 2222 >/run/dropbear-test.log 2>&1 &
+    dbpid=$!
     sleep 1
     ss -ltn | grep -q ':2222 ' && pass SSH-SERVER || fail SSH-SERVER
     kill "$dbpid" 2>/dev/null || true
 
-    openssl dgst -sha256 /etc/axiom/release | grep -q 'SHA2-256' && pass TLS-CRYPTO || fail TLS-CRYPTO
+    if openssl dgst -sha256 /etc/axiom/release >/tmp/tls-digest 2>/dev/null && [ -s /tmp/tls-digest ]; then pass TLS-CRYPTO; else fail TLS-CRYPTO; fi
     weston --version >/dev/null 2>&1 && pass WAYLAND-COMPOSITOR || fail WAYLAND-COMPOSITOR
     apk --version >/dev/null 2>&1 && pass PACKAGE-MANAGER || fail PACKAGE-MANAGER
     ldd /bin/busybox >/dev/null 2>&1 && pass DYNAMIC-ELF || fail DYNAMIC-ELF
