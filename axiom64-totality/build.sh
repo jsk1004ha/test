@@ -19,7 +19,7 @@ CID="$(docker run -d --privileged "$IMAGE" sleep 7200)"
 cleanup() { docker rm -f "$CID" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-RUNTIME_PACKAGES='alpine-base linux-virt kmod busybox-extras openrc util-linux iproute2 nftables e2fsprogs btrfs-progs xfsprogs dosfstools pciutils usbutils nvme-cli smartmontools cryptsetup lvm2 mdadm tpm2-tools dropbear openssh-client curl ca-certificates openssl bash jq coreutils findutils grep sed gawk procps strace lsof ethtool tcpdump iperf3 socat bind-tools chrony wireguard-tools libcap musl-utils zstd lz4 xz alsa-utils weston mesa-dri-gallium mesa-egl mesa-gbm libdrm wayland dbus seatd scanelf'
+RUNTIME_PACKAGES='alpine-base linux-firmware-none linux-lts kmod busybox-extras openrc util-linux iproute2 nftables e2fsprogs btrfs-progs xfsprogs dosfstools pciutils usbutils nvme-cli smartmontools cryptsetup lvm2 mdadm tpm2-tools dropbear openssh-client curl ca-certificates openssl bash jq coreutils findutils grep sed gawk procps strace lsof ethtool tcpdump iperf3 socat bind-tools chrony wireguard-tools libcap musl-utils zstd lz4 xz alsa-utils weston mesa-dri-gallium mesa-egl mesa-gbm libdrm wayland dbus seatd scanelf'
 BUILD_PACKAGES='build-base linux-headers'
 
 docker exec "$CID" sh -euxc "apk update && apk add --no-cache $RUNTIME_PACKAGES $BUILD_PACKAGES"
@@ -70,11 +70,11 @@ cat > "$ROOTFS/etc/axiom/build.json" <<EOF
 {"name":"Axiom64 Totality","version":"$VERSION","base":"$BASE_DIGEST","kernel":"$KERNEL_VERSION","profile":"hybrid-qualified","rootfs":"immutable-initramfs"}
 EOF
 
-KERNEL_SRC="$ROOTFS/boot/vmlinuz-virt"
+KERNEL_SRC="$ROOTFS/boot/vmlinuz-lts"
 test -s "$KERNEL_SRC"
 cp "$KERNEL_SRC" "$OUT/vmlinuz-axiom64"
 # The live root does not need another copy of its kernel or Alpine-generated initramfs.
-rm -f "$ROOTFS/boot/vmlinuz-virt" "$ROOTFS/boot/initramfs-virt"
+rm -f "$ROOTFS/boot/vmlinuz-lts" "$ROOTFS/boot/initramfs-lts"
 
 # Build the initramfs in two explicit stages and exclude sockets/pseudo-fs
 # contents. Root executes cpio so deliberately unreadable setuid helpers keep
