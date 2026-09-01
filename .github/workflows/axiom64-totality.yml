@@ -1,88 +1,127 @@
-name: Axiom64 Totality 7 qualified build
+name: Axiom64 Totality 8
 
 on:
   push:
-    branches: ["axiom64-totality-7"]
+    branches:
+      - axiom64-totality-8
     paths:
       - "axiom64-totality/**"
       - ".github/workflows/axiom64-totality.yml"
   workflow_dispatch:
 
+concurrency:
+  group: axiom64-totality-8-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  SOURCE_DATE_EPOCH: "1788220800"
 
 jobs:
   build-and-qualify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Install host build and virtualization tools
+      - name: Install host toolchain and firmware
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            binutils gcc make cpio zstd xz-utils zip unzip jq \
-            qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools \
-            grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools \
-            e2fsprogs btrfs-progs xfsprogs dosfstools kmod
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential binutils cpio docker.io curl ca-certificates git jq \
+            qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools tpm2-tools \
+            e2fsprogs btrfs-progs xfsprogs cryptsetup-bin lvm2 mdadm \
+            wireguard-tools nftables iproute2 util-linux numactl \
+            grub-pc-bin grub-efi-amd64-bin grub-common xorriso \
+            mtools dosfstools zstd zip unzip openssl uuid-runtime \
+            sbsigntool systemd-ukify systemd-boot-efi python3-virt-firmware
+          sudo systemctl stop docker || true
+          sudo dockerd > /tmp/dockerd.log 2>&1 &
+          for i in $(seq 1 60); do
+            if docker info >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker info
+          ukify --version
+          virt-fw-vars --help >/tmp/virt-fw-vars-help.txt
 
-      - name: Install pinned QEMU 11 and stage firmware
+      - name: Stage QEMU 11
+        working-directory: axiom64-totality
         run: |
-          mkdir -p axiom64-totality/tools/qemu axiom64-totality/tools/qemu-data
-          curl -fL --retry 5 \
-            https://github.com/hermeticbuild/qemu-prebuilt/releases/download/11.0.0.1/qemu-system-bin-linux-amd64-x86_64-softmmu-11.0.0.1.tar.gz \
-            -o /tmp/qemu.tar.gz
-          tar -xzf /tmp/qemu.tar.gz -C axiom64-totality/tools/qemu
-          find axiom64-totality/tools/qemu -type f -name 'qemu-system-x86_64*' -exec chmod +x {} +
-          cp -a /usr/share/qemu/. axiom64-totality/tools/qemu-data/ 2>/dev/null || true
-          cp -a /usr/share/seabios/. axiom64-totality/tools/qemu-data/ 2>/dev/null || true
-          cp -a /usr/share/ipxe/. axiom64-totality/tools/qemu-data/ 2>/dev/null || true
-          test -s axiom64-totality/tools/qemu-data/bios-256k.bin
+          mkdir -p tools/qemu tools/qemu-data
+          curl -fL --retry 5 --retry-all-errors \
+            -o /tmp/qemu.tar.gz \
+            https://github.com/hermeticbuild/qemu-prebuilt/releases/download/11.0.0.1/qemu-system-bin-linux-amd64-x86_64-softmmu-11.0.0.1.tar.gz
+          tar -xzf /tmp/qemu.tar.gz -C tools/qemu
+          QEMU=$(find tools/qemu -type f -name qemu-system-x86_64 -print -quit)
+          test -n "$QEMU"
+          chmod +x "$QEMU"
+          cp -a /usr/share/qemu/. tools/qemu-data/
+          "$QEMU" --version
+          test -s tools/qemu-data/bios-256k.bin
 
-      - name: Build Totality image
-        run: ./axiom64-totality/build.sh
-
-      - name: Run QEMU qualification matrix
-        run: ./axiom64-totality/test.sh
-
-      - name: Publish qualification summary
-        if: always()
+      - name: Syntax checks
+        working-directory: axiom64-totality
         run: |
-          test -f axiom64-totality/out/build-report.txt && cat axiom64-totality/out/build-report.txt || true
-          test -f axiom64-totality/out/qualification-report.txt && cat axiom64-totality/out/qualification-report.txt || true
+          bash -n build.sh test.sh
+          sh -n rootfs-overlay/sbin/axiom-init
+          sh -n rootfs-overlay/usr/sbin/axiom-selftest
 
-      - name: Upload failure diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Axiom64-Totality-7.0.0-diagnostics-${{ github.run_number }}
-          path: |
-            axiom64-totality/out/build-report.txt
-            axiom64-totality/out/qualification-report.txt
-            axiom64-totality/out/build-trace.log
-            axiom64-totality/out/cpio.log
-            axiom64-totality/out/grub-mkrescue.log
-            axiom64-totality/out/grub-mkrescue-ci.log
-            axiom64-totality/out/logs/**
-          if-no-files-found: warn
-          retention-days: 7
-          compression-level: 9
+      - name: Build release
+        working-directory: axiom64-totality
+        run: sudo --preserve-env=SOURCE_DATE_EPOCH ./build.sh
 
-      - name: Upload qualified OS
+      - name: Qualification matrix
+        working-directory: axiom64-totality
+        run: sudo --preserve-env=SOURCE_DATE_EPOCH,GITHUB_SHA ./test.sh
+
+      - name: Show qualification certificate
+        if: success()
+        working-directory: axiom64-totality
+        run: |
+          cat out/build-report.txt
+          cat out/qualification-certificate.txt
+          cat out/qualification-report.txt
+          cat out/FINAL-SHA256SUMS
+
+      - name: Upload qualified release
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Axiom64-Totality-7.0.0-qualified
+          name: Axiom64-Totality-8.0.0-qualified
           path: |
-            axiom64-totality/out/Axiom64-Totality-7.0.0.zip
-            axiom64-totality/out/axiom64-totality-7.0.0.iso
+            axiom64-totality/out/Axiom64-Totality-8.0.0.zip
+            axiom64-totality/out/axiom64-totality-8.0.0.iso
+            axiom64-totality/out/axiom64-totality-8.0.0-secureboot-esp.img
+            axiom64-totality/out/axiom64-totality-8.0.0-signed.efi
+            axiom64-totality/out/Axiom64-Totality-8-SecureBoot.cer
+            axiom64-totality/out/Axiom64-Totality-8-SecureBoot.pem
+            axiom64-totality/out/Axiom64-Totality-8.0.0-source.tar.zst
             axiom64-totality/out/vmlinuz-axiom64
             axiom64-totality/out/initramfs-axiom64.zst
-            axiom64-totality/out/build-report.txt
-            axiom64-totality/out/qualification-report.txt
-            axiom64-totality/out/SHA256SUMS
             axiom64-totality/out/SBOM.spdx.json
+            axiom64-totality/out/provenance.json
+            axiom64-totality/out/qualification-report.txt
+            axiom64-totality/out/qualification-certificate.txt
+            axiom64-totality/out/FINAL-SHA256SUMS
             axiom64-totality/out/logs/**
+          compression-level: 0
           retention-days: 30
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Axiom64-Totality-8.0.0-diagnostics-${{ github.run_number }}
+          path: |
+            axiom64-totality/out/**
+            axiom64-totality/work/**/*.log
+            /tmp/dockerd.log
+          if-no-files-found: ignore
+          retention-days: 14
           compression-level: 0
