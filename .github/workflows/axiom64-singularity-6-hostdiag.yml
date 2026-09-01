@@ -1,0 +1,69 @@
+name: Axiom64 Singularity 6 host diagnostics
+
+on:
+  push:
+    branches:
+      - axiom64-singularity-6-hostdiag
+    paths:
+      - 'axiom64-singularity-6.0.0/**'
+      - '.github/workflows/axiom64-singularity-6-hostdiag.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compile toolchain
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            nasm lld binutils gcc make mtools sbsigntool openssl python3
+      - name: Build BIOS UEFI and host assembly
+        working-directory: axiom64-singularity-6.0.0
+        run: |
+          make clean
+          make all
+      - name: Structural check without model reports
+        working-directory: axiom64-singularity-6.0.0
+        run: |
+          file build/*
+          objdump -x build/BOOTX64.EFI | head -120
+          nm -g --defined-only build/advanced.o
+
+  native-assembly:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native toolchain
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nasm binutils gcc make
+      - name: Execute assembly harness
+        working-directory: axiom64-singularity-6.0.0
+        run: make host-test
+
+  bounded-model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run bounded model
+        working-directory: axiom64-singularity-6.0.0
+        run: make model-test
+
+  symbolic-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Z3
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-z3
+      - name: Run symbolic proofs
+        working-directory: axiom64-singularity-6.0.0
+        run: make proof-test
