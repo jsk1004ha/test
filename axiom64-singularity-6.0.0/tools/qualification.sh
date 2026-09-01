@@ -12,11 +12,36 @@ fail() {
 
 require_marker() {
   local file=$1 marker=$2
+  [[ -f "$file" ]] || fail "missing log file $file"
   grep -aFq "$marker" "$file" || fail "missing '$marker' in $file"
 }
 
+wait_for_socket() {
+  local path=$1
+  for _ in $(seq 1 100); do
+    [[ -S "$path" ]] && return 0
+    sleep 0.05
+  done
+  fail "socket did not appear: $path"
+}
+
+stop_pidfile() {
+  local pidfile=$1
+  if [[ -f "$pidfile" ]]; then
+    local pid
+    pid=$(cat "$pidfile")
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$pidfile"
+  fi
+}
+
 run_tpm() {
-  timeout 25s "$@"
+  timeout -k 3s 25s "$@"
 }
 
 find_ovmf_pair() {
@@ -86,8 +111,7 @@ require_marker "$BUILD/qemu-bios.log" "LONG_MODE: PASS"
 require_marker "$BUILD/qemu-bios.log" "CPU_HARDENING_SCAN: PASS"
 require_marker "$BUILD/qemu-bios.log" "BIOS_QUALIFICATION_COMPLETE: PASS"
 
-# Prove that firmware enforcement rejects a one-byte mutation of the signed
-# image before our EFI entry point can emit its first marker.
+# Prove firmware rejects a one-byte mutation before EFI entry executes.
 cp "$BUILD/BOOTX64.SIGNED.EFI" "$BUILD/BOOTX64.TAMPERED.EFI"
 python3 - "$BUILD/BOOTX64.TAMPERED.EFI" <<'PY'
 from pathlib import Path
@@ -115,30 +139,30 @@ timeout -k 5s 15s "$QEMU" \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04
 TAMPER_RC=$?
 set -e
-if grep -aFq "UEFI_BOOT: PASS" "$BUILD/qemu-uefi-tamper.log"; then
+if [[ -f "$BUILD/qemu-uefi-tamper.log" ]] && \
+   grep -aFq "UEFI_BOOT: PASS" "$BUILD/qemu-uefi-tamper.log"; then
   fail "tampered EFI image reached efi_main under Secure Boot"
 fi
 
-# Start a TPM 2.0 instance. Port 2322 is QEMU's control channel; port 2321 is
-# used sequentially by tpm2-tools after QEMU exits.
+# QEMU's TPM emulator backend requires a Unix control socket: QEMU passes the
+# data-channel file descriptor over that socket with SCM_RIGHTS.
 TPM_DIR="$BUILD/swtpm-state"
+QEMU_TPM_SOCK="$TPM_DIR/qemu-control.sock"
+QEMU_TPM_PID="$BUILD/swtpm-qemu.pid"
 rm -rf "$TPM_DIR"
 mkdir -p "$TPM_DIR"
 swtpm socket \
   --tpm2 \
   --tpmstate dir="$TPM_DIR" \
-  --server type=tcp,port=2321,bindaddr=127.0.0.1 \
-  --ctrl type=tcp,port=2322,bindaddr=127.0.0.1 \
-  --flags not-need-init,startup-clear \
-  --pid file="$BUILD/swtpm.pid" \
-  --log level=20,file="$BUILD/swtpm.log" \
+  --ctrl type=unixio,path="$QEMU_TPM_SOCK",mode=0600 \
+  --pid file="$QEMU_TPM_PID" \
+  --log level=20,file="$BUILD/swtpm-qemu.log" \
   --daemon
-sleep 1
+wait_for_socket "$QEMU_TPM_SOCK"
 
 cleanup() {
-  if [[ -f "$BUILD/swtpm.pid" ]]; then
-    kill "$(cat "$BUILD/swtpm.pid")" 2>/dev/null || true
-  fi
+  stop_pidfile "$QEMU_TPM_PID"
+  stop_pidfile "$BUILD/swtpm-tools.pid"
 }
 trap cleanup EXIT
 
@@ -160,7 +184,7 @@ timeout -k 5s 60s "$QEMU" \
   -serial file:"$BUILD/qemu-uefi-secure.log" \
   -monitor none \
   -net none \
-  -chardev socket,id=chrtpm,host=127.0.0.1,port=2322 \
+  -chardev socket,id=chrtpm,path="$QEMU_TPM_SOCK" \
   -tpmdev emulator,id=tpm0,chardev=chrtpm \
   -device tpm-tis,tpmdev=tpm0 \
   -no-reboot \
@@ -176,6 +200,21 @@ require_marker "$BUILD/qemu-uefi-secure.log" "TPM2_GET_RANDOM: PASS"
 require_marker "$BUILD/qemu-uefi-secure.log" "EXIT_BOOT_SERVICES: PASS"
 require_marker "$BUILD/qemu-uefi-secure.log" "POST_FIRMWARE_KERNEL_OWNERSHIP: PASS"
 require_marker "$BUILD/qemu-uefi-secure.log" "UEFI_QUALIFICATION_COMPLETE: PASS"
+
+# Stop the QEMU-control instance cleanly, then reopen the same persistent TPM
+# state on the standard swtpm TCP command/control ports for tpm2-tools.
+stop_pidfile "$QEMU_TPM_PID"
+rm -f "$QEMU_TPM_SOCK"
+swtpm socket \
+  --tpm2 \
+  --tpmstate dir="$TPM_DIR" \
+  --server type=tcp,port=2321,bindaddr=127.0.0.1 \
+  --ctrl type=tcp,port=2322,bindaddr=127.0.0.1 \
+  --flags not-need-init,startup-clear \
+  --pid file="$BUILD/swtpm-tools.pid" \
+  --log level=20,file="$BUILD/swtpm-tools.log" \
+  --daemon
+sleep 1
 
 # Bind the signed artifact to PCR14 and verify a nonce-qualified quote.
 export TPM2TOOLS_TCTI="swtpm:host=127.0.0.1,port=2321"
