@@ -1,0 +1,112 @@
+#!/bin/busybox sh
+set -u
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+MODE=${1:-core}
+EXPECTED=${2:-1}
+FAILURES=0
+
+pass() { echo "$1: PASS"; }
+fail() { echo "$1: FAIL${2:+ — $2}"; FAILURES=$((FAILURES+1)); }
+check_cmd() { command -v "$1" >/dev/null 2>&1 && pass "COMMAND-$1" || fail "COMMAND-$1"; }
+waitdev() { i=0; while [ "$i" -lt 100 ]; do [ -b "$1" ] && return 0; sleep 0.1; i=$((i+1)); done; return 1; }
+
+CPUS=$(nproc 2>/dev/null || echo 1)
+echo "CPU-COUNT: $CPUS"
+[ "$CPUS" -eq "$EXPECTED" ] && pass SMP || fail SMP "expected=$EXPECTED actual=$CPUS"
+[ -r /proc/self/status ] && pass PROCFS || fail PROCFS
+[ -d /sys/devices/system/cpu ] && pass SYSFS || fail SYSFS
+mountpoint -q /sys/fs/cgroup && grep -q cgroup2 /proc/mounts && pass CGROUP-V2 || fail CGROUP-V2
+unshare -m /bin/true >/dev/null 2>&1 && pass MOUNT-NAMESPACE || fail MOUNT-NAMESPACE
+/usr/bin/axiom-security-probe || FAILURES=$((FAILURES+1))
+/usr/bin/axiom-asm-probe >/tmp/asm.out 2>&1 && grep -q 'AXIOM-ASSEMBLY-PLANE: PASS' /tmp/asm.out && pass ASSEMBLY-PLANE || fail ASSEMBLY-PLANE
+
+rm -rf /tmp/ovl-lower /tmp/ovl-upper /tmp/ovl-work /tmp/ovl-merged
+mkdir -p /tmp/ovl-lower /tmp/ovl-upper /tmp/ovl-work /tmp/ovl-merged
+echo immutable > /tmp/ovl-lower/seed
+if mount -t overlay overlay -o lowerdir=/tmp/ovl-lower,upperdir=/tmp/ovl-upper,workdir=/tmp/ovl-work /tmp/ovl-merged 2>/dev/null; then
+    echo mutable > /tmp/ovl-merged/new && grep -q mutable /tmp/ovl-upper/new && pass OVERLAYFS || fail OVERLAYFS
+    umount /tmp/ovl-merged
+else fail OVERLAYFS; fi
+
+if [ -d /sys/firmware/efi ]; then echo 'BOOT-FIRMWARE: UEFI'; else echo 'BOOT-FIRMWARE: BIOS'; fi
+
+if [ "$MODE" = full ]; then
+    [ -d /sys/devices/system/node/node1 ] && pass NUMA || fail NUMA
+    if [ -d /sys/kernel/iommu_groups ] && find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 | grep -q .; then pass IOMMU; else fail IOMMU; fi
+
+    waitdev /dev/vda || fail VIRTIO-BLK 'device absent'
+    waitdev /dev/nvme0n1 || fail NVME 'device absent'
+    waitdev /dev/sda || fail AHCI 'device absent'
+
+    test_disk() {
+        dev=$1 label=$2 marker=$3 mp=/mnt/$label
+        mkdir -p "$mp"
+        actual=$(blkid -s LABEL -o value "$dev" 2>/dev/null || true)
+        if [ "$actual" != "$label" ]; then fail "$marker" "label=$actual"; return; fi
+        if mount -t ext4 -o rw "$dev" "$mp" 2>/dev/null; then
+            token="Axiom64-$label-$(cat /proc/uptime | cut -d. -f1)"
+            printf '%s\n' "$token" > "$mp/qualification.txt"
+            sync
+            if grep -qx "$token" "$mp/qualification.txt"; then pass "$marker"; else fail "$marker" 'readback'; fi
+            umount "$mp"
+        else fail "$marker" 'mount'; fi
+    }
+    [ -b /dev/vda ] && test_disk /dev/vda AXIOM_VIRTIO VIRTIO-BLK
+    [ -b /dev/nvme0n1 ] && test_disk /dev/nvme0n1 AXIOM_NVME NVME
+    [ -b /dev/sda ] && test_disk /dev/sda AXIOM_AHCI AHCI
+
+    if [ -c /dev/tpm0 ] || [ -c /dev/tpmrm0 ]; then
+        if tpm2_getrandom 16 >/tmp/tpm.random 2>/tmp/tpm.err && [ "$(wc -c </tmp/tpm.random)" -ge 16 ]; then pass TPM2; else fail TPM2; fi
+    else fail TPM2 'device absent'; fi
+
+    if [ -d /sys/bus/usb/devices ] && find /sys/bus/usb/devices -mindepth 1 -maxdepth 1 | grep -q .; then pass XHCI-USB; else fail XHCI-USB; fi
+
+    if ip -4 -o addr show scope global | grep -q '10\.0\.2\.'; then
+        ping -c 1 -W 3 10.0.2.2 >/dev/null 2>&1 && pass NETWORK || fail NETWORK 'gateway unreachable'
+    else fail NETWORK 'DHCP address absent'; fi
+
+    [ -c /dev/dri/card0 ] && pass GPU-DRM || fail GPU-DRM
+    grep -q '^ *0 ' /proc/asound/cards 2>/dev/null && pass AUDIO || fail AUDIO
+
+    if nft add table inet axiom_test 2>/dev/null; then
+        nft 'add chain inet axiom_test input { type filter hook input priority 0; policy accept; }' 2>/dev/null && pass NFTABLES || fail NFTABLES
+        nft delete table inet axiom_test 2>/dev/null || true
+    else fail NFTABLES; fi
+
+    if ip link add wgtest type wireguard 2>/dev/null; then ip link del wgtest; pass WIREGUARD; else fail WIREGUARD; fi
+
+    dd if=/dev/zero of=/tmp/btrfs.img bs=1M count=128 status=none
+    loopb=$(losetup -f --show /tmp/btrfs.img 2>/dev/null || true)
+    if [ -n "$loopb" ] && mkfs.btrfs -q -f "$loopb" >/dev/null 2>&1; then
+        mkdir -p /mnt/btrfs
+        if mount -t btrfs "$loopb" /mnt/btrfs 2>/dev/null; then echo btrfs-ok >/mnt/btrfs/probe; sync; grep -q btrfs-ok /mnt/btrfs/probe && pass BTRFS || fail BTRFS; umount /mnt/btrfs; else fail BTRFS; fi
+        losetup -d "$loopb"
+    else fail BTRFS; [ -n "$loopb" ] && losetup -d "$loopb" 2>/dev/null || true; fi
+
+    dd if=/dev/zero of=/tmp/crypt.img bs=1M count=64 status=none
+    loopc=$(losetup -f --show /tmp/crypt.img 2>/dev/null || true)
+    if [ -n "$loopc" ] && printf 'Axiom64-qualification-key' | cryptsetup open --type plain --cipher aes-xts-plain64 --key-size 256 --key-file - "$loopc" axiomcrypt >/dev/null 2>&1; then
+        mkfs.ext4 -q -F /dev/mapper/axiomcrypt
+        mkdir -p /mnt/crypt
+        if mount /dev/mapper/axiomcrypt /mnt/crypt; then echo encrypted >/mnt/crypt/probe; sync; grep -q encrypted /mnt/crypt/probe && pass DM-CRYPT || fail DM-CRYPT; umount /mnt/crypt; else fail DM-CRYPT; fi
+        cryptsetup close axiomcrypt
+        losetup -d "$loopc"
+    else fail DM-CRYPT; [ -n "$loopc" ] && losetup -d "$loopc" 2>/dev/null || true; fi
+
+    dropbear -R -E -p 2222 >/run/dropbear-test.log 2>&1 & dbpid=$!
+    sleep 1
+    ss -ltn | grep -q ':2222 ' && pass SSH-SERVER || fail SSH-SERVER
+    kill "$dbpid" 2>/dev/null || true
+
+    openssl dgst -sha256 /etc/axiom/release | grep -q 'SHA2-256' && pass TLS-CRYPTO || fail TLS-CRYPTO
+    weston --version >/dev/null 2>&1 && pass WAYLAND-COMPOSITOR || fail WAYLAND-COMPOSITOR
+    apk --version >/dev/null 2>&1 && pass PACKAGE-MANAGER || fail PACKAGE-MANAGER
+    ldd /bin/busybox >/dev/null 2>&1 && pass DYNAMIC-ELF || fail DYNAMIC-ELF
+fi
+
+if [ "$FAILURES" -eq 0 ]; then
+    echo "SELFTEST-SUMMARY: PASS mode=$MODE"
+    exit 0
+fi
+echo "SELFTEST-SUMMARY: FAIL mode=$MODE failures=$FAILURES"
+exit 1

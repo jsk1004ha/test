@@ -1,0 +1,86 @@
+#!/bin/busybox sh
+set -u
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root
+umask 027
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs -o mode=0755 dev /dev
+mkdir -p /dev/pts /dev/shm /run /tmp /root /mnt /sys/fs/cgroup
+mount -t devpts -o gid=5,mode=0620 devpts /dev/pts 2>/dev/null || true
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null || true
+mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup 2>/dev/null || true
+
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+mdev -s
+hostname axiom64-totality
+
+for module in virtio_pci virtio_blk virtio_net nvme ahci libahci xhci_pci usbhid hid_generic tpm_tis tpm_crb virtio_gpu snd_hda_intel loop dm_mod dm_crypt overlay btrfs xfs wireguard; do
+    modprobe "$module" 2>/dev/null || true
+done
+mdev -s
+
+sysctl -w kernel.kptr_restrict=2 >/dev/null 2>&1 || true
+sysctl -w kernel.dmesg_restrict=1 >/dev/null 2>&1 || true
+sysctl -w kernel.unprivileged_bpf_disabled=1 >/dev/null 2>&1 || true
+sysctl -w fs.protected_hardlinks=1 >/dev/null 2>&1 || true
+sysctl -w fs.protected_symlinks=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.rp_filter=1 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1 || true
+
+ip link set lo up 2>/dev/null || true
+for path in /sys/class/net/*; do
+    iface=${path##*/}
+    [ "$iface" = lo ] && continue
+    ip link set "$iface" up 2>/dev/null || true
+    udhcpc -n -q -t 5 -T 2 -i "$iface" >/run/udhcpc.log 2>&1 || true
+done
+
+getarg() {
+    key=$1
+    for arg in $(cat /proc/cmdline); do
+        case "$arg" in "$key"=*) echo "${arg#*=}"; return 0;; esac
+    done
+    return 1
+}
+
+MODE=$(getarg axiom.test 2>/dev/null || true)
+EXPECTED=$(getarg axiom.expected_cpus 2>/dev/null || echo 1)
+
+cat /etc/issue
+/usr/bin/axiom-asm-probe || true
+
+if [ -n "$MODE" ]; then
+    /usr/sbin/axiom-selftest "$MODE" "$EXPECTED"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        case "$MODE" in
+            core) echo 'AXIOM-CORE-QUALIFIED: PASS';;
+            full) echo 'AXIOM-FULL-QUALIFIED: PASS';;
+            iso)  echo 'AXIOM-ISO-QUALIFIED: PASS';;
+        esac
+    else
+        echo "AXIOM-QUALIFICATION: FAIL rc=$rc"
+    fi
+    sync
+    poweroff -f 2>/dev/null || true
+    sleep 3
+    echo o > /proc/sysrq-trigger 2>/dev/null || true
+    while :; do sleep 60; done
+fi
+
+mkdir -p /etc/dropbear
+if command -v dropbearkey >/dev/null 2>&1; then
+    [ -s /etc/dropbear/dropbear_rsa_host_key ] || dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null
+    dropbear -R -E -p 22 2>/run/dropbear.log || true
+fi
+
+echo
+printf '%s\n' 'Axiom64 Totality interactive maintenance environment' \
+  'Root filesystem: immutable initramfs' \
+  'Run: axiom-selftest core 1'
+exec setsid cttyhack /bin/bash -l

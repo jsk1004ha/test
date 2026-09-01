@@ -1,0 +1,64 @@
+name: Axiom64 Totality 7 qualified build
+
+on:
+  push:
+    branches: ["axiom64-totality-7"]
+    paths:
+      - "axiom64-totality/**"
+      - ".github/workflows/axiom64-totality.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host build and virtualization tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils gcc make cpio zstd xz-utils zip unzip jq \
+            qemu-system-x86 qemu-utils ovmf swtpm swtpm-tools \
+            grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools \
+            e2fsprogs btrfs-progs xfsprogs dosfstools kmod
+
+      - name: Install pinned QEMU 11 static binary
+        run: |
+          mkdir -p axiom64-totality/tools/qemu
+          curl -fL --retry 5 \
+            https://github.com/hermeticbuild/qemu-prebuilt/releases/download/11.0.0.1/qemu-system-bin-linux-amd64-x86_64-softmmu-11.0.0.1.tar.gz \
+            -o /tmp/qemu.tar.gz
+          tar -xzf /tmp/qemu.tar.gz -C axiom64-totality/tools/qemu
+          find axiom64-totality/tools/qemu -type f -name 'qemu-system-x86_64*' -exec chmod +x {} +
+
+      - name: Build Totality image
+        run: ./axiom64-totality/build.sh
+
+      - name: Run QEMU qualification matrix
+        run: ./axiom64-totality/test.sh
+
+      - name: Publish qualification summary
+        if: always()
+        run: |
+          test -f axiom64-totality/out/qualification-report.txt && cat axiom64-totality/out/qualification-report.txt || true
+
+      - name: Upload qualified OS
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Axiom64-Totality-7.0.0-qualified
+          path: |
+            axiom64-totality/out/Axiom64-Totality-7.0.0.zip
+            axiom64-totality/out/axiom64-totality-7.0.0.iso
+            axiom64-totality/out/vmlinuz-axiom64
+            axiom64-totality/out/initramfs-axiom64.zst
+            axiom64-totality/out/qualification-report.txt
+            axiom64-totality/out/SHA256SUMS
+            axiom64-totality/out/SBOM.spdx.json
+            axiom64-totality/out/logs/**
+          retention-days: 30

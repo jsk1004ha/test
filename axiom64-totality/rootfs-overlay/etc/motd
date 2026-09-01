@@ -1,0 +1,2 @@
+Axiom64 Totality 7.0.0
+Run `axiom-selftest core 1` to inspect isolation primitives.
