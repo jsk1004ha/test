@@ -2,63 +2,90 @@
 set -u
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root
+export LANG=C.UTF-8
 umask 027
+
+getarg() {
+    key=$1
+    for arg in $(cat /proc/cmdline 2>/dev/null); do
+        case "$arg" in "$key"=*) echo "${arg#*=}"; return 0;; esac
+    done
+    return 1
+}
+MODE=$(getarg axiom.test 2>/dev/null || true)
+EXPECTED=$(getarg axiom.expected_cpus 2>/dev/null || echo 1)
 
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs -o mode=0755 dev /dev
-mkdir -p /dev/pts /dev/shm /run /tmp /root /mnt /sys/fs/cgroup
+mkdir -p /dev/pts /dev/shm /run /run/lock/lvm /run/netns /run/crun /tmp /root /mnt \
+  /sys/fs/cgroup /sys/kernel/security /sys/kernel/debug /sys/kernel/config
 mount -t devpts -o gid=5,mode=0620 devpts /dev/pts 2>/dev/null || true
 mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mkdir -p /run/lock/lvm /run/netns /run/crun
 mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
 mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null || true
 mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup 2>/dev/null || true
+mount -t securityfs -o nosuid,nodev,noexec securityfs /sys/kernel/security 2>/dev/null || true
+mount -t debugfs -o nosuid,nodev,noexec debugfs /sys/kernel/debug 2>/dev/null || true
+mount -t configfs -o nosuid,nodev,noexec configfs /sys/kernel/config 2>/dev/null || true
+mount -t efivarfs -o nosuid,nodev,noexec efivarfs /sys/firmware/efi/efivars 2>/dev/null || true
 
 echo /sbin/mdev > /proc/sys/kernel/hotplug
 mdev -s
 hostname axiom64-totality
 
-# Load complete dependency stacks explicitly.  In a tiny immutable system there
-# is no full userspace device manager to infer every late dependency for us.
 for module in \
     virtio virtio_ring virtio_pci virtio_blk virtio_net \
     scsi_mod sd_mod sg sr_mod \
     nvme_core nvme \
     libata libahci ahci \
-    usbcore xhci_hcd xhci_pci hid usbhid hid_generic usbkbd usbmouse \
+    usbcore usb_storage uas xhci_hcd xhci_pci hid usbhid hid_generic usbkbd usbmouse \
     drm drm_kms_helper virtio_gpu \
     snd snd_timer snd_pcm snd_hda_codec snd_hda_codec_generic snd_hda_intel \
     tpm tpm_tis_core tpm_tis tpm_crb \
-    loop dm_mod dm_crypt dm_verity \
+    loop dm_mod dm_crypt dm_verity dm_snapshot dm_bufio dm_persistent_data \
     md_mod raid1 raid10 \
-    overlay btrfs xfs ext4 \
-    wireguard tun bridge br_netfilter nf_tables; do
+    overlay btrfs xfs ext4 squashfs fuse \
+    wireguard tun veth bridge br_netfilter nf_tables \
+    efivarfs configs; do
     modprobe "$module" 2>/dev/null || true
 done
 
-# Re-scan after asynchronous PCI/ACPI probing and again after a brief settle
-# period so devtmpfs/mdev nodes exist before the qualification program runs.
 mdev -s
-for _ in 1 2 3 4 5; do
-    [ -b /dev/vda ] && [ -b /dev/nvme0n1 ] && \
-      { [ -b /dev/sda ] || [ -b /dev/sdb ]; } && \
-      { [ -c /dev/tpmrm0 ] || [ -c /dev/tpm0 ]; } && break
-    sleep 1
-    mdev -s 2>/dev/null || true
-done
+if [ "$MODE" = full ]; then
+    for _ in $(seq 1 20); do
+        v=$(blkid -L AXIOM_VIRTIO 2>/dev/null || true)
+        n=$(blkid -L AXIOM_NVME 2>/dev/null || true)
+        a=$(blkid -L AXIOM_AHCI 2>/dev/null || true)
+        u=$(blkid -L AXIOM_USB 2>/dev/null || true)
+        if [ -b "$v" ] && [ -b "$n" ] && [ -b "$a" ] && [ -b "$u" ] && \
+           { [ -c /dev/tpmrm0 ] || [ -c /dev/tpm0 ]; }; then
+            break
+        fi
+        sleep 1
+        mdev -s 2>/dev/null || true
+    done
+fi
 
 sysctl -w kernel.kptr_restrict=2 >/dev/null 2>&1 || true
 sysctl -w kernel.dmesg_restrict=1 >/dev/null 2>&1 || true
 sysctl -w kernel.unprivileged_bpf_disabled=1 >/dev/null 2>&1 || true
 sysctl -w kernel.yama.ptrace_scope=2 >/dev/null 2>&1 || true
+sysctl -w kernel.kexec_load_disabled=1 >/dev/null 2>&1 || true
+sysctl -w kernel.perf_event_paranoid=3 >/dev/null 2>&1 || true
+sysctl -w kernel.randomize_va_space=2 >/dev/null 2>&1 || true
 sysctl -w fs.protected_hardlinks=1 >/dev/null 2>&1 || true
 sysctl -w fs.protected_symlinks=1 >/dev/null 2>&1 || true
 sysctl -w fs.protected_fifos=2 >/dev/null 2>&1 || true
 sysctl -w fs.protected_regular=2 >/dev/null 2>&1 || true
+sysctl -w fs.suid_dumpable=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.default.rp_filter=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.tcp_syncookies=1 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.all.accept_redirects=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.default.accept_redirects=0 >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.all.send_redirects=0 >/dev/null 2>&1 || true
 sysctl -w net.ipv6.conf.all.accept_redirects=0 >/dev/null 2>&1 || true
 
 ip link set lo up 2>/dev/null || true
@@ -66,21 +93,10 @@ for path in /sys/class/net/*; do
     iface=${path##*/}
     [ "$iface" = lo ] && continue
     ip link set "$iface" up 2>/dev/null || true
-    udhcpc -n -q -t 5 -T 2 -i "$iface" >/run/udhcpc.log 2>&1 || true
+    udhcpc -n -q -t 5 -T 2 -i "$iface" >"/run/udhcpc-$iface.log" 2>&1 || true
 done
 
-getarg() {
-    key=$1
-    for arg in $(cat /proc/cmdline); do
-        case "$arg" in "$key"=*) echo "${arg#*=}"; return 0;; esac
-    done
-    return 1
-}
-
-MODE=$(getarg axiom.test 2>/dev/null || true)
-EXPECTED=$(getarg axiom.expected_cpus 2>/dev/null || echo 1)
-
-cat /etc/issue
+cat /etc/issue 2>/dev/null || true
 /usr/bin/axiom-asm-probe || true
 
 if [ -n "$MODE" ]; then
@@ -88,12 +104,13 @@ if [ -n "$MODE" ]; then
     rc=$?
     if [ "$rc" -eq 0 ]; then
         case "$MODE" in
-            core) echo 'AXIOM-CORE-QUALIFIED: PASS';;
-            full) echo 'AXIOM-FULL-QUALIFIED: PASS';;
-            iso)  echo 'AXIOM-ISO-QUALIFIED: PASS';;
+            core)       echo 'AXIOM-CORE-QUALIFIED: PASS';;
+            full)       echo 'AXIOM-FULL-QUALIFIED: PASS';;
+            iso)        echo 'AXIOM-ISO-QUALIFIED: PASS';;
+            secureboot) echo 'AXIOM-SECUREBOOT-QUALIFIED: PASS';;
         esac
     else
-        echo "AXIOM-QUALIFICATION: FAIL rc=$rc"
+        echo "AXIOM-QUALIFICATION: FAIL mode=$MODE rc=$rc"
     fi
     sync
     poweroff -f 2>/dev/null || true
@@ -104,12 +121,13 @@ fi
 
 mkdir -p /etc/dropbear
 if command -v dropbearkey >/dev/null 2>&1; then
-    [ -s /etc/dropbear/dropbear_rsa_host_key ] || dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null
+    [ -s /etc/dropbear/dropbear_rsa_host_key ] || \
+      dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null
     dropbear -R -E -p 22 2>/run/dropbear.log || true
 fi
 
-echo
-printf '%s\n' 'Axiom64 Totality interactive maintenance environment' \
-  'Root filesystem: immutable initramfs' \
+printf '\n%s\n' \
+  'Axiom64 Totality 8.0.0 interactive maintenance environment' \
+  'Immutable base, capability-oriented assembly diagnostics, Linux LTS service plane.' \
   'Run: axiom-selftest core 1'
 exec setsid cttyhack /bin/bash -l
