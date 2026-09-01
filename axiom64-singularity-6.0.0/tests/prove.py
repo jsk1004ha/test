@@ -19,6 +19,8 @@ from z3 import (
     Not,
     Or,
     Solver,
+    UGE,
+    ULT,
     ZeroExt,
     unsat,
 )
@@ -83,23 +85,23 @@ def main() -> None:
         Extract(63, 32, icr) == destination,
     )
 
-    # KASLR is expressed without nonlinear multiplication: slot is already the
-    # entropy-reduced value produced by the executable assembly's unsigned div.
-    slot = Int("slot")
-    slots = Int("slots")
-    alignment = Int("alignment")
-    base = Int("base")
-    kaslr = base + slot * alignment
-    kaslr_assumptions = [slots > 0, slot >= 0, slot < slots, alignment > 0, base >= 0]
+    # The executable KASLR primitive places the image in one of 64 2-MiB
+    # slots. Prove the actual 64-bit address arithmetic rather than asking an
+    # older solver to decide nonlinear integer multiplication/modulo.
+    kaslr_slot = BitVec("kaslr_slot", 6)
+    kaslr_base = BitVecVal(0xFFFFFFFF80000000, 64)
+    kaslr_alignment_shift = 21
+    kaslr_arena_end = BitVecVal(0xFFFFFFFF88000000, 64)
+    kaslr_address = kaslr_base + (ZeroExt(58, kaslr_slot) << kaslr_alignment_shift)
     prove(
-        "KASLR address remains inside the configured slot arena",
-        kaslr_assumptions,
-        And(kaslr >= base, kaslr < base + slots * alignment),
+        "KASLR address remains inside its 64-slot arena",
+        None,
+        And(UGE(kaslr_address, kaslr_base), ULT(kaslr_address, kaslr_arena_end)),
     )
     prove(
-        "KASLR address remains aligned relative to its base",
-        kaslr_assumptions,
-        (kaslr - base) % alignment == 0,
+        "KASLR address remains 2-MiB aligned",
+        None,
+        Extract(20, 0, kaslr_address) == BitVecVal(0, 21),
     )
 
     cpl = BitVec("cpl", 2)
