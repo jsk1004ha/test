@@ -45,7 +45,19 @@ jobs:
       - name: Publish qualification summary
         if: always()
         run: |
+          test -f axiom64-totality/out/build-report.txt && cat axiom64-totality/out/build-report.txt || true
           test -f axiom64-totality/out/qualification-report.txt && cat axiom64-totality/out/qualification-report.txt || true
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Axiom64-Totality-7.0.0-diagnostics-${{ github.run_attempt }}
+          path: |
+            axiom64-totality/out/**
+            axiom64-totality/work/*.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload qualified OS
         if: success()
@@ -57,6 +69,7 @@ jobs:
             axiom64-totality/out/axiom64-totality-7.0.0.iso
             axiom64-totality/out/vmlinuz-axiom64
             axiom64-totality/out/initramfs-axiom64.zst
+            axiom64-totality/out/build-report.txt
             axiom64-totality/out/qualification-report.txt
             axiom64-totality/out/SHA256SUMS
             axiom64-totality/out/SBOM.spdx.json

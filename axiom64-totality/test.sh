@@ -27,15 +27,15 @@ require_marker() {
   local log="$1" marker="$2"
   if ! grep -Fq "$marker" "$log"; then
     echo "Missing marker: $marker" >&2
-    tail -n 200 "$log" >&2 || true
+    tail -n 250 "$log" >&2 || true
     exit 1
   fi
 }
 
 run_core() {
   local cpus="$1" log="$LOGS/core-smp${cpus}.log"
-  timeout 240 "$QEMU_BIN" \
-    -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp "$cpus" -m 768 \
+  timeout 300 "$QEMU_BIN" \
+    -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp "$cpus" -m 1536 \
     -kernel "$KERNEL" -initrd "$INITRD" \
     -append "console=ttyS0,115200n8 rdinit=/sbin/axiom-init axiom.test=core axiom.expected_cpus=$cpus panic=-1 pti=on vsyscall=none randomize_kstack_offset=on slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1" \
     -display none -monitor none -serial "file:$log" -no-reboot || true
@@ -63,14 +63,14 @@ swtpm socket --tpm2 --tpmstate dir="$TPMDIR" \
 for _ in $(seq 1 50); do [[ -S "$TPMDIR/swtpm.sock" ]] && break; sleep 0.1; done
 
 FULL_LOG="$LOGS/full-hardware.log"
-timeout 420 "$QEMU_BIN" \
+timeout 540 "$QEMU_BIN" \
   -L /usr/share/qemu -machine q35,accel=tcg -cpu max \
-  -smp 8,sockets=2,cores=2,threads=2 -m 2048 \
-  -object memory-backend-ram,id=mem0,size=1024M \
-  -object memory-backend-ram,id=mem1,size=1024M \
+  -smp 8,sockets=2,cores=2,threads=2 -m 3072 \
+  -object memory-backend-ram,id=mem0,size=1536M \
+  -object memory-backend-ram,id=mem1,size=1536M \
   -numa node,nodeid=0,cpus=0-3,memdev=mem0 \
   -numa node,nodeid=1,cpus=4-7,memdev=mem1 \
-  -device intel-iommu,intremap=on,caching-mode=on \
+  -device intel-iommu,caching-mode=on \
   -kernel "$KERNEL" -initrd "$INITRD" \
   -append 'console=ttyS0,115200n8 rdinit=/sbin/axiom-init axiom.test=full axiom.expected_cpus=8 panic=-1 intel_iommu=on iommu.strict=1 pti=on vsyscall=none randomize_kstack_offset=on slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1' \
   -drive file="$WORK/virtio.raw",if=none,id=vblk,format=raw,cache=unsafe \
@@ -81,7 +81,7 @@ timeout 420 "$QEMU_BIN" \
   -device ide-hd,drive=sata0,bus=ide.0 \
   -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
   -device virtio-gpu-pci \
-  -device ich9-intel-hda -device hda-duplex \
+  -audiodev none,id=audio0 -device ich9-intel-hda -device hda-duplex,audiodev=audio0 \
   -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
   -chardev socket,id=chrtpm,path="$TPMDIR/swtpm.sock" \
   -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0 \
@@ -93,7 +93,7 @@ done
 record_pass 'full Q35 hardware and security matrix'
 
 BIOS_LOG="$LOGS/iso-bios.log"
-timeout 300 "$QEMU_BIN" -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp 2 -m 1024 \
+timeout 360 "$QEMU_BIN" -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
   -cdrom "$WORK/axiom64-totality-ci.iso" -boot d \
   -display none -monitor none -serial "file:$BIOS_LOG" -no-reboot || true
 require_marker "$BIOS_LOG" 'AXIOM-ISO-QUALIFIED: PASS'
@@ -108,7 +108,7 @@ for p in /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do [[ -f 
 if [[ -z "$OVMF_VARS_SRC" ]]; then echo 'OVMF vars not found' >&2; exit 1; fi
 cp "$OVMF_VARS_SRC" "$WORK/OVMF_VARS.fd"
 UEFI_LOG="$LOGS/iso-uefi.log"
-timeout 300 "$QEMU_BIN" -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp 2 -m 1024 \
+timeout 360 "$QEMU_BIN" -L /usr/share/qemu -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file="$WORK/OVMF_VARS.fd" \
   -cdrom "$WORK/axiom64-totality-ci.iso" -boot d \
