@@ -46,10 +46,12 @@ run_core() {
   local cpus="$1"
   local log="$LOGS/core-smp${cpus}.log"
   timeout 300 "$QEMU_BIN" \
-    -L "$QEMU_DATA" -machine q35,accel=tcg -cpu max -smp "$cpus" -m 1536 \
+    -L "$QEMU_DATA" -no-user-config -nodefaults \
+    -machine q35,accel=tcg -cpu max -smp "$cpus" -m 1536 \
     -kernel "$KERNEL" -initrd "$INITRD" \
     -append "console=ttyS0,115200n8 rdinit=/sbin/axiom-init axiom.test=core axiom.expected_cpus=$cpus panic=-1 pti=on vsyscall=none randomize_kstack_offset=on slab_nomerge init_on_alloc=1 init_on_free=1 page_alloc.shuffle=1" \
-    -display none -monitor none -serial "file:$log" -no-reboot || true
+    -chardev file,id=serial0,path="$log" -device isa-serial,chardev=serial0 \
+    -display none -monitor none -no-reboot || true
   require_marker "$log" "AXIOM-CORE-QUALIFIED: PASS"
   require_marker "$log" "CPU-COUNT: $cpus"
   record_pass "SMP $cpus core boot"
@@ -77,7 +79,8 @@ for _ in $(seq 1 50); do [[ -S "$TPMDIR/swtpm.sock" ]] && break; sleep 0.1; done
 
 FULL_LOG="$LOGS/full-hardware.log"
 timeout 540 "$QEMU_BIN" \
-  -L "$QEMU_DATA" -machine q35,accel=tcg -cpu max \
+  -L "$QEMU_DATA" -no-user-config -nodefaults \
+  -machine q35,accel=tcg -cpu max \
   -smp 8,sockets=2,cores=2,threads=2 -m 3072 \
   -object memory-backend-ram,id=mem0,size=1536M \
   -object memory-backend-ram,id=mem1,size=1536M \
@@ -91,14 +94,23 @@ timeout 540 "$QEMU_BIN" \
   -drive file="$WORK/nvme.raw",if=none,id=nvme0,format=raw,cache=unsafe \
   -device nvme,drive=nvme0,serial=AXIOMNVME \
   -drive file="$WORK/sata.raw",if=none,id=sata0,format=raw,cache=unsafe \
-  -device ide-hd,drive=sata0,bus=ide.0 \
-  -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0 \
+  -device ich9-ahci,id=ahci \
+  -device ide-hd,drive=sata0,bus=ahci.0 \
+  -device qemu-xhci,id=xhci \
+  -device usb-kbd,bus=xhci.0 \
+  -device usb-tablet,bus=xhci.0 \
   -device virtio-gpu-pci \
-  -audiodev none,id=audio0 -device ich9-intel-hda -device hda-duplex,audiodev=audio0 \
-  -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+  -audiodev none,id=audio0 \
+  -device ich9-intel-hda \
+  -device hda-duplex,audiodev=audio0 \
+  -netdev user,id=net0 \
+  -device virtio-net-pci,netdev=net0,romfile= \
   -chardev socket,id=chrtpm,path="$TPMDIR/swtpm.sock" \
-  -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-tis,tpmdev=tpm0 \
-  -display none -monitor none -serial "file:$FULL_LOG" -no-reboot || true
+  -tpmdev emulator,id=tpm0,chardev=chrtpm \
+  -device tpm-tis,tpmdev=tpm0 \
+  -chardev file,id=serial0,path="$FULL_LOG" \
+  -device isa-serial,chardev=serial0 \
+  -display none -monitor none -no-reboot || true
 require_marker "$FULL_LOG" 'AXIOM-FULL-QUALIFIED: PASS'
 for marker in 'IOMMU: PASS' 'TPM2: PASS' 'VIRTIO-BLK: PASS' 'NVME: PASS' 'AHCI: PASS' 'XHCI-USB: PASS' 'NETWORK: PASS' 'GPU-DRM: PASS' 'AUDIO: PASS' 'DM-CRYPT: PASS' 'BTRFS: PASS' 'WIREGUARD: PASS'; do
   require_marker "$FULL_LOG" "$marker"
@@ -106,9 +118,14 @@ done
 record_pass 'full Q35 hardware and security matrix'
 
 BIOS_LOG="$LOGS/iso-bios.log"
-timeout 360 "$QEMU_BIN" -L "$QEMU_DATA" -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
-  -cdrom "$WORK/axiom64-totality-ci.iso" -boot d \
-  -display none -monitor none -serial "file:$BIOS_LOG" -no-reboot || true
+timeout 360 "$QEMU_BIN" \
+  -L "$QEMU_DATA" -no-user-config -nodefaults \
+  -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
+  -drive file="$WORK/axiom64-totality-ci.iso",media=cdrom,if=none,id=cd0,format=raw,readonly=on \
+  -device ich9-ahci,id=ahci \
+  -device ide-cd,drive=cd0,bus=ahci.0,bootindex=1 \
+  -chardev file,id=serial0,path="$BIOS_LOG" -device isa-serial,chardev=serial0 \
+  -display none -monitor none -no-reboot || true
 require_marker "$BIOS_LOG" 'AXIOM-ISO-QUALIFIED: PASS'
 require_marker "$BIOS_LOG" 'BOOT-FIRMWARE: BIOS'
 record_pass 'hybrid ISO legacy BIOS boot'
@@ -121,11 +138,16 @@ for p in /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do [[ -f 
 if [[ -z "$OVMF_VARS_SRC" ]]; then echo 'OVMF vars not found' >&2; exit 1; fi
 cp "$OVMF_VARS_SRC" "$WORK/OVMF_VARS.fd"
 UEFI_LOG="$LOGS/iso-uefi.log"
-timeout 360 "$QEMU_BIN" -L "$QEMU_DATA" -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
+timeout 360 "$QEMU_BIN" \
+  -L "$QEMU_DATA" -no-user-config -nodefaults \
+  -machine q35,accel=tcg -cpu max -smp 2 -m 1536 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file="$WORK/OVMF_VARS.fd" \
-  -cdrom "$WORK/axiom64-totality-ci.iso" -boot d \
-  -display none -monitor none -serial "file:$UEFI_LOG" -no-reboot || true
+  -drive file="$WORK/axiom64-totality-ci.iso",media=cdrom,if=none,id=cd0,format=raw,readonly=on \
+  -device ich9-ahci,id=ahci \
+  -device ide-cd,drive=cd0,bus=ahci.0,bootindex=1 \
+  -chardev file,id=serial0,path="$UEFI_LOG" -device isa-serial,chardev=serial0 \
+  -display none -monitor none -no-reboot || true
 require_marker "$UEFI_LOG" 'AXIOM-ISO-QUALIFIED: PASS'
 require_marker "$UEFI_LOG" 'BOOT-FIRMWARE: UEFI'
 record_pass 'hybrid ISO native UEFI boot'
