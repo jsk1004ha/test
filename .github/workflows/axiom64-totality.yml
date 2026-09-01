@@ -27,14 +27,18 @@ jobs:
             grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools \
             e2fsprogs btrfs-progs xfsprogs dosfstools kmod
 
-      - name: Install pinned QEMU 11 static binary
+      - name: Install pinned QEMU 11 and stage firmware
         run: |
-          mkdir -p axiom64-totality/tools/qemu
+          mkdir -p axiom64-totality/tools/qemu axiom64-totality/tools/qemu-data
           curl -fL --retry 5 \
             https://github.com/hermeticbuild/qemu-prebuilt/releases/download/11.0.0.1/qemu-system-bin-linux-amd64-x86_64-softmmu-11.0.0.1.tar.gz \
             -o /tmp/qemu.tar.gz
           tar -xzf /tmp/qemu.tar.gz -C axiom64-totality/tools/qemu
           find axiom64-totality/tools/qemu -type f -name 'qemu-system-x86_64*' -exec chmod +x {} +
+          cp -a /usr/share/qemu/. axiom64-totality/tools/qemu-data/ 2>/dev/null || true
+          cp -a /usr/share/seabios/. axiom64-totality/tools/qemu-data/ 2>/dev/null || true
+          cp -a /usr/share/ipxe/. axiom64-totality/tools/qemu-data/ 2>/dev/null || true
+          test -s axiom64-totality/tools/qemu-data/bios-256k.bin
 
       - name: Build Totality image
         run: ./axiom64-totality/build.sh
@@ -52,12 +56,18 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: Axiom64-Totality-7.0.0-diagnostics-${{ github.run_attempt }}
+          name: Axiom64-Totality-7.0.0-diagnostics-${{ github.run_number }}
           path: |
-            axiom64-totality/out/**
-            axiom64-totality/work/*.log
+            axiom64-totality/out/build-report.txt
+            axiom64-totality/out/qualification-report.txt
+            axiom64-totality/out/build-trace.log
+            axiom64-totality/out/cpio.log
+            axiom64-totality/out/grub-mkrescue.log
+            axiom64-totality/out/grub-mkrescue-ci.log
+            axiom64-totality/out/logs/**
           if-no-files-found: warn
           retention-days: 7
+          compression-level: 9
 
       - name: Upload qualified OS
         if: success()
@@ -75,3 +85,4 @@ jobs:
             axiom64-totality/out/SBOM.spdx.json
             axiom64-totality/out/logs/**
           retention-days: 30
+          compression-level: 0
