@@ -1,49 +1,105 @@
-# Axiom64 Totality 7.0.0
+# Axiom64 Totality 8.0.0
 
-Axiom64 Totality is the practical, hardware-rich companion to the native Axiom64 capability-microkernel research line.
+Axiom64 Totality is a qualified x86-64 operating-system image that combines a
+small hand-written assembly diagnostic plane with a Linux LTS hardware and
+service plane. The hybrid design is intentional: a modern usable system must
+support real firmware interfaces, multiprocessor scheduling, IOMMUs, storage,
+filesystems, networking, graphics, audio, USB, cryptography and application
+isolation. Reimplementing every mature subsystem in one unreviewed assembly
+kernel would reduce, not increase, trustworthiness.
 
-The live system is assembled from Alpine Linux 3.24.1 and its hardened `linux-virt` kernel, then augmented with an assembly-only diagnostic plane, a fail-closed init, hardware qualification, TPM/IOMMU checks, storage persistence tests, namespace/cgroup/seccomp/Landlock tests, an immutable initramfs, and a hybrid BIOS/UEFI ISO.
+## Architecture
 
-It is intentionally described as a **hybrid operating system distribution**, not as a from-scratch pure-assembly kernel. Mature Linux subsystems provide the broad hardware and application compatibility that cannot honestly be reproduced as a complete new kernel in a single release.
-
-## Qualified targets
-
-The CI matrix exercises:
-
-- 1, 2, 4, and 8 virtual CPUs
-- two NUMA nodes
-- Intel VT-d/IOMMU strict translation
-- TPM 2.0 through swtpm
-- virtio-blk, NVMe, and AHCI persistence
-- virtio-net DHCP and TCP/IP
-- xHCI with USB keyboard and tablet
-- virtio GPU DRM and Intel HDA audio discovery
-- ext4 journaling, Btrfs, OverlayFS, loop and dm-crypt
-- cgroup v2, mount namespaces, seccomp-BPF, Landlock, nftables, WireGuard
-- BIOS and UEFI boot of the same ISO
-
-## Build
-
-```bash
-sudo apt-get install docker.io binutils gcc cpio zstd zip grub-pc-bin grub-efi-amd64-bin xorriso mtools qemu-system-x86 ovmf swtpm
-./build.sh
-./test.sh
+```text
+BIOS / UEFI / UEFI Secure Boot
+        |
+        +-- GRUB hybrid ISO
+        +-- signed Unified Kernel Image (UKI)
+                    |
+              Linux LTS x86-64
+                    |
+    +---------------+--------------------+
+    |                                    |
+Assembly diagnostic plane         Alpine/musl service plane
+syscall / CPUID / RDTSC            storage, network, TPM, OCI,
+serial and protection probes       Wayland, SSH, crypto, tools
 ```
 
-## Run
+The base root filesystem is a compressed immutable initramfs. Runtime writes
+live in RAM or on explicitly mounted block devices. The release contains a
+hybrid BIOS/UEFI ISO, signed UKI, Secure-Boot ESP image, complete source archive,
+package SBOM, provenance and qualification evidence.
+
+## Qualified execution profiles
+
+A release is not marked qualified unless all mandatory profiles pass:
+
+- direct-kernel boot with 1, 2, 4 and 8 virtual CPUs;
+- Q35 with two NUMA nodes and strict Intel VT-d translation;
+- virtio-blk, NVMe, AHCI and USB mass storage with write, sync, readback and
+  host-side post-poweroff verification;
+- xHCI keyboard/tablet/storage, virtio GPU, HDA audio and virtio networking;
+- TPM 2.0 random generation, PCR access and object seal/unseal;
+- BIOS and native UEFI boot of the same hybrid ISO;
+- custom-key UEFI Secure Boot of the signed UKI;
+- one-byte signed-payload tamper rejection before Linux starts.
+
+## Security and isolation tests
+
+The guest executes positive and negative tests for:
+
+- seccomp filtering and Landlock filesystem confinement;
+- KASLR, page-table isolation, namespaces, cgroup v2 and kernel hardening;
+- PIDFD, `clone3`, `openat2`, an actual `io_uring` NOP completion,
+  `memfd_secret`, immutable memory seals and frozen eBPF maps;
+- LUKS2/dm-crypt and dm-verity, including deliberate corruption rejection;
+- OCI isolation through crun with PID, mount, UTS, IPC and cgroup namespaces,
+  no capabilities, `noNewPrivileges` and a read-only root;
+- nftables and a real encrypted WireGuard tunnel between network namespaces;
+- ACLs, extended attributes, kernel keyrings and TLS handshakes;
+- Btrfs read-only snapshots, XFS, SquashFS, md RAID1 and LVM snapshots.
+
+## Runtime services
+
+The live environment contains a package manager, dynamically linked musl
+userland, Dropbear SSH, Weston/Wayland, cryptographic and storage utilities,
+network diagnostics and an interactive maintenance shell. The default network
+and kernel policy is hardened; unprivileged BPF, kexec, kernel pointers and
+unrestricted performance events are disabled.
+
+## Building
+
+The reference build runs on Ubuntu 24.04 with Docker and the packages installed
+by `.github/workflows/axiom64-totality.yml`.
+
+```bash
+cd axiom64-totality
+sudo ./build.sh
+sudo ./test.sh
+```
+
+The test harness uses QEMU 11, OVMF, swtpm and a custom Secure Boot certificate.
+The private qualification key is ephemeral and is never included in the
+release. The public certificate is included so the UKI can be verified or
+enrolled in a separate test firmware variable store.
+
+## Running the hybrid ISO
 
 ```bash
 qemu-system-x86_64 \
   -machine q35 \
   -cpu max \
   -smp 8 \
-  -m 2048 \
-  -cdrom out/axiom64-totality-7.0.0.iso \
+  -m 4096 \
+  -cdrom axiom64-totality-8.0.0.iso \
   -serial stdio
 ```
 
-The interactive live environment starts Dropbear SSH when a network interface is available and opens a root maintenance shell on the console. The root filesystem is an immutable compressed initramfs; runtime state lives in RAM unless an explicitly mounted disk is used.
+## Scope of the claim
 
-## Claim boundary
-
-This release does not claim that every physical device ever produced is supported, nor that the Linux kernel was written by this project. It claims a reproducibly specified, independently boot-tested integration with explicit evidence for each qualified subsystem.
+Totality 8.0.0 is designed to be the most capable and most thoroughly tested
+Axiom64 release. Its qualification applies to the declared x86-64/Q35 virtual
+hardware matrix. It is not a proof that every physical device, CPU erratum or
+third-party application in existence is supported, and it is not a formal
+machine-code proof comparable to a verified microkernel. Unsupported or
+untested behavior is not relabeled as implemented.
